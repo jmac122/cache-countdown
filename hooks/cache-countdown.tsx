@@ -27,6 +27,7 @@ import {
   fit,
   fmtClock,
   fmtCountdown,
+  fmtSpan,
   fmtTokens,
   hitRatio,
   isCachingDisabled,
@@ -164,7 +165,7 @@ async function tick($: EngineInterface) {
       if (mark !== undefined) {
         toastLevel = mark
         const tail = secs <= URGENT_SECS ? 'send a message now' : `send a message to keep ${fmtTokens(promptTokens(s.last))} tokens warm`
-        $.ui.toast(`cache expires in ${secs >= 60 ? fmtClock(s.left) : `${secs}s`}: ${tail}`)
+        $.ui.toast(`cache expires in ${fmtSpan(secs)}: ${tail}`)
       }
     }
     // nothing left to count: stop until the next request; else sleep until the next thing to do

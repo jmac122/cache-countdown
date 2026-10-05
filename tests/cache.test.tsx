@@ -10,6 +10,8 @@ import {
   fmtCountdown,
   nextDelay,
   parseMarks,
+  parseSpan,
+  fmtSpan,
   fmtTokens,
   missReason,
   nextToastMark,
@@ -86,6 +88,17 @@ describe('pure logic', () => {
     expect(nextToastMark(2, marks, Infinity)).toBe(3)
     expect(parseMarks('junk')).toEqual([60, 10, 5, 1])
     expect(parseMarks('5,300,5')).toEqual([300, 5])
+    expect(parseMarks('30m, 15m, 5m, 1m')).toEqual([1800, 900, 300, 60])
+    expect(parseMarks('5m,2m,1m')).toEqual([300, 120, 60])
+    expect(parseMarks('1m, 10s, 5s, 1s')).toEqual([60, 10, 5, 1])
+    expect(parseSpan('1h')).toBe(3600)
+    expect(parseSpan('1.5 min')).toBe(90)
+    expect(parseSpan('90')).toBe(90)
+    expect(parseSpan('5x')).toBeUndefined()
+    expect(fmtSpan(1800)).toBe('30 min')
+    expect(fmtSpan(3600)).toBe('1 hr')
+    expect(fmtSpan(90)).toBe('1:30')
+    expect(fmtSpan(10)).toBe('10s')
   })
 
   test('pace: minute steps, then seconds in the final stretch; the timer sleeps until the next change', () => {
@@ -233,7 +246,7 @@ describe('band', () => {
     await mid.unmount()
     await w.clock.advance(51_000)
     expect(w.toasts.length).toBe(4)
-    expect(w.toasts[0]).toContain('1:00')
+    expect(w.toasts[0]).toContain('expires in 1 min')
     expect(w.toasts[3]).toContain('1s')
     const done = await band($)
     expect(await done.find({ type: 'Text', text: /expired/ })).toBeDefined()
@@ -321,9 +334,24 @@ describe('pace and toasts are configurable', () => {
   })
 })
 
+describe('toasts in minutes', () => {
+  test('30m,15m,5m,1m on a 1h cache: four toasts worded in minutes', { options: { ttl: '1h', toastAt: '30m,15m,5m,1m' } }, async ($, on) => {
+    const w = world(on)
+    await start($)
+    await step($)
+    await w.clock.advance(3_601_000)
+    expect(w.toasts).toEqual([
+      'cache expires in 30 min: send a message to keep 81.3k tokens warm',
+      'cache expires in 15 min: send a message to keep 81.3k tokens warm',
+      'cache expires in 5 min: send a message to keep 81.3k tokens warm',
+      'cache expires in 1 min: send a message to keep 81.3k tokens warm',
+    ])
+  })
+})
+
 describe('setup wizard', () => {
   test('pure: draft from options, toast row, changes', () => {
-    const d = draftFromOptions({ ttl: 'auto', tickSeconds: 60, warnSeconds: 60, finalTickSeconds: 1, toast: true, toastAt: '60,10,5,1', toastMinTokens: 20_000, compactAtTokens: 100_000, band: true, status: false })
+    const d = draftFromOptions({ ttl: 'auto', tickSeconds: 60, warnSeconds: 60, finalTickSeconds: 1, toast: true, toastAt: '1m,10s,5s,1s', toastMinTokens: 20_000, compactAtTokens: 100_000, band: true, status: false })
     expect(d).toEqual(PRESETS[0]!.draft)
     expect(toastsRow(false, '60')).toBe('off')
     expect(splitToasts('off')).toEqual({ toast: false })
@@ -353,7 +381,7 @@ describe('setup wizard', () => {
     await pane.unmount()
     expect(written).toEqual([
       { key: 'cache-countdown.tickSeconds', value: 1 },
-      { key: 'cache-countdown.toastAt', value: '300,60,10' },
+      { key: 'cache-countdown.toastAt', value: '5m,2m,1m' },
       { key: 'cache-countdown.status', value: true },
     ])
     expect(w.toasts.at(-1)).toContain('tickSeconds = 1')

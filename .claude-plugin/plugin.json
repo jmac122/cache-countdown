@@ -1,6 +1,6 @@
 {
   "name": "cache-countdown",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Prompt-cache meter above the prompt: hit %, read/wrote/new tokens, a TTL countdown and advice (warm, soon, expired, miss, off). /cache opens a pane with a countdown bar, the last request's stacked bar and a per-turn table; /cache setup is a settings wizard. Configurable tick rate: once a minute by default, every second in the final minute.",
   "types": "./types/index.d.ts",
   "author": {
@@ -53,14 +53,14 @@
     },
     "band": {
       "type": "boolean",
-      "title": "Band above the prompt",
-      "description": "Show the meter as a row above the prompt",
+      "title": "Meter row above the input box",
+      "description": "The full meter (hit %, tokens, countdown, advice) as a row directly above the box you type in",
       "default": true
     },
     "status": {
       "type": "boolean",
-      "title": "Status line entry",
-      "description": "Also pin a short entry (hit % and countdown) under the prompt",
+      "title": "Footer line beside your statusline",
+      "description": "Also a short line in the footer under the input box (\"cache 86% · 59m\"), on its own line; your statusline is untouched",
       "default": false
     },
     "toast": {
@@ -71,9 +71,9 @@
     },
     "toastAt": {
       "type": "string",
-      "title": "Toast at (seconds left)",
-      "description": "Comma-separated seconds left at which a toast fires, e.g. 60,10,5,1. Keep marks at least 3 s apart: Claude Code drops a toast within 2 s of the previous one",
-      "default": "60,10,5,1"
+      "title": "Toast at (time left)",
+      "description": "Comma-separated times left at which a toast fires, with units: 30m,15m,5m,1m or 1m,10s,5s,1s (h, m, s; a bare number is seconds). Keep marks at least 3 s apart: Claude Code drops a toast within 2 s of the previous one",
+      "default": "1m,10s,5s,1s"
     },
     "toastMinTokens": {
       "type": "number",

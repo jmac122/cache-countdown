@@ -56,9 +56,10 @@ export const FIELDS: Field[] = [
     key: 'toasts',
     label: 'Expiry toasts',
     choices: [
-      { value: '60,10,5,1', label: 'at 60, 10, 5 and 1 s left (recommended)' },
-      { value: '300,60,10', label: 'at 5 min, 60 s and 10 s left' },
-      { value: '60', label: 'once, at 60 s left' },
+      { value: '1m,10s,5s,1s', label: 'at 1 min, 10 s, 5 s and 1 s left (recommended)' },
+      { value: '30m,15m,5m,1m', label: 'at 30, 15, 5 and 1 min left' },
+      { value: '5m,2m,1m', label: 'at 5, 2 and 1 min left' },
+      { value: '1m', label: 'once, at 1 min left' },
       { value: 'off', label: 'off' },
     ],
   },
@@ -83,7 +84,7 @@ export const FIELDS: Field[] = [
   },
   {
     key: 'band',
-    label: 'Band above the prompt',
+    label: 'Meter row above the input box',
     choices: [
       { value: true, label: 'on (recommended)' },
       { value: false, label: 'off' },
@@ -91,7 +92,7 @@ export const FIELDS: Field[] = [
   },
   {
     key: 'status',
-    label: 'Status line entry',
+    label: 'Footer line beside your statusline',
     choices: [
       { value: false, label: 'off (recommended)' },
       { value: true, label: 'on' },
@@ -105,7 +106,7 @@ export const DEFAULTS: SetupDraft = {
   tickSeconds: 60,
   warnSeconds: 60,
   finalTickSeconds: 1,
-  toasts: '60,10,5,1',
+  toasts: '1m,10s,5s,1s',
   toastMinTokens: 20_000,
   compactAtTokens: 100_000,
   band: true,
@@ -124,7 +125,7 @@ export const PRESETS: { key: PresetKey; label: string; draft: SetupDraft }[] = [
   {
     key: 'live',
     label: 'Live: per-second countdown, status entry, early toasts',
-    draft: { ...DEFAULTS, tickSeconds: 1, toasts: '300,60,10', status: true },
+    draft: { ...DEFAULTS, tickSeconds: 1, toasts: '5m,2m,1m', status: true },
   },
 ]
 
@@ -149,7 +150,7 @@ export function choicesFor(field: Field, current: Value | undefined): Choice[] {
 /** Merge the toast pair into the wizard's one "toasts" row. */
 export function toastsRow(toast: unknown, toastAt: unknown): string {
   if (toast === false) return 'off'
-  return typeof toastAt === 'string' && toastAt.trim() ? toastAt.replace(/\s+/g, '') : '60,10,5,1'
+  return typeof toastAt === 'string' && toastAt.trim() ? toastAt.replace(/\s+/g, '') : '1m,10s,5s,1s'
 }
 
 /** The wizard's "toasts" row back into the two settings it stands for. */

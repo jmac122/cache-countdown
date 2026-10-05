@@ -194,11 +194,33 @@ export const DEFAULT_TOAST_AT = [60, 10, 5, 1]
 /** From here down a toast says "send a message now". */
 export const URGENT_SECS = 10
 
-/** "60, 10, 3, 1" → [60, 10, 3, 1]: positive whole seconds, unique, largest first; nothing valid → fallback. */
+const UNIT_SECONDS: Record<string, number> = { s: 1, m: 60, h: 3600 }
+
+/**
+ * One time-left mark in seconds: "30m", "10s", "1h", "1.5m", or a bare number
+ * meaning seconds ("90"). Undefined for anything else.
+ */
+export function parseSpan(token: string): number | undefined {
+  const m = /^(\d+(?:\.\d+)?)\s*(h|hrs?|hours?|m|mins?|minutes?|s|secs?|seconds?)?$/i.exec(token.trim())
+  if (!m) return undefined
+  const unit = (m[2] ?? 's')[0]!.toLowerCase()
+  const secs = Math.round(Number(m[1]) * (UNIT_SECONDS[unit] ?? 1))
+  return secs > 0 ? secs : undefined
+}
+
+/** "30m, 15m, 5m, 1m" → [1800, 900, 300, 60]: seconds, unique, largest first; nothing valid → fallback. */
 export function parseMarks(v: unknown, fallback: readonly number[] = DEFAULT_TOAST_AT): number[] {
-  const raw = Array.isArray(v) ? v : typeof v === 'string' ? v.split(/[\s,;]+/) : []
-  const marks = [...new Set(raw.map(Number).filter(n => Number.isFinite(n) && n > 0).map(n => Math.round(n)))]
+  const raw = Array.isArray(v) ? v.map(String) : typeof v === 'string' ? v.split(/[,;]+/) : []
+  const marks = [...new Set(raw.map(parseSpan).filter((n): n is number => n !== undefined))]
   return marks.length ? marks.sort((a, b) => b - a) : [...fallback]
+}
+
+/** Time left in words for a toast: "30 min", "1 hr", "1:30", "10s". */
+export function fmtSpan(secs: number): string {
+  if (secs >= 3600 && secs % 3600 === 0) return `${secs / 3600} hr`
+  if (secs >= 60 && secs % 60 === 0) return `${secs / 60} min`
+  if (secs >= 60) return fmtClock(secs * 1000)
+  return `${secs}s`
 }
 
 /** The toast mark due now, or undefined. `level` is the last mark fired for this entry (Infinity before any); a late tick skips to the newest mark. */
