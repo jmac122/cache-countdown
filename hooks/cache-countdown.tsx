@@ -214,7 +214,7 @@ async function applyPending($: EngineInterface) {
 async function openSetup($: EngineInterface) {
   await update($, draftAtom, () => draftFromOptions(current))
   await update($, noteAtom, () => '')
-  await $.ui.open({ id: SETUP, title: 'cache setup', focus: true, closeOnEscape: true })
+  await $.ui.open({ id: SETUP, title: 'cache setup', focus: true, closeOnEscape: true, columns: 76, rows: 22 })
   await $.store.set('setupSeen', true).catch(() => undefined)
 }
 
@@ -383,7 +383,7 @@ export const register: Register = (on, options) => {
       return { text: 'cache pane closed' }
     }
     await update($, paneAtom, () => true)
-    await $.ui.open({ id: PANE, title: 'cache', focus: true, closeOnEscape: true })
+    await $.ui.open({ id: PANE, title: 'cache', focus: true, closeOnEscape: true, columns: 64, rows: 24 })
     const s = await snapshot($, await $.clock.now())
     if (s.left > 0) startTimer($)
     return { text: `${s.ttl} cache (${s.source}) · ${s.advice.text} · /${COMMAND} stop closes` }
@@ -414,14 +414,19 @@ export const register: Register = (on, options) => {
 
     return (
       <Box flexDirection="column">
-        <Text bold color="cyan">cache-countdown setup</Text>
-        <Text dimColor wrap="wrap">{`Detected: ${s.ttl} cache (${s.source})`}</Text>
-        <Text dimColor wrap="wrap">Save writes your Claude Code settings, as /config does.</Text>
-        <Box key="preset" marginTop={1}>
+        <Box key="head" flexDirection="row" columnGap={1} flexWrap="wrap">
+          <Text bold color="cyan">cache-countdown setup</Text>
+          <Text dimColor>{`· detected ${s.ttl} (${s.source})`}</Text>
+        </Box>
+        <Box key="actions" flexDirection="row" columnGap={2}>
+          <Button key="save" label={count ? `Save ${count} change${count === 1 ? '' : 's'}` : 'Save'} variant="primary" onPress={() => void saveSetup($)} />
+          <Button key="reset" label="Recommended" onPress={() => void presetSetup($, PRESETS[0]!.draft)} />
+          <Button key="cancel" label="Cancel" role="dismiss" onPress={() => void $.ui.close({ id: SETUP })} />
+        </Box>
+        <Box key="preset">
           <Select
             key="preset"
             label="Preset"
-            autoFocus
             options={[...PRESETS.map(p => ({ value: p.key, label: p.label })), ...(preset ? [] : [{ value: 'custom', label: 'Custom' }])]}
             value={preset?.key ?? 'custom'}
             onSelect={v => {
@@ -430,7 +435,8 @@ export const register: Register = (on, options) => {
             }}
           />
         </Box>
-        <Box key="fields" flexDirection="column" marginTop={1}>
+        <Text key="about" dimColor wrap="wrap">{preset ? preset.about : 'your own picks'}</Text>
+        <Box key="fields" flexDirection="column">
           {FIELDS.map(f => (
             <Select
               key={f.key}
@@ -441,12 +447,7 @@ export const register: Register = (on, options) => {
             />
           ))}
         </Box>
-        <Box key="actions" flexDirection="row" columnGap={2} marginTop={1}>
-          <Button key="save" label={count ? `Save ${count} change${count === 1 ? '' : 's'}` : 'Save'} variant="primary" onPress={() => void saveSetup($)} />
-          <Button key="reset" label="Recommended" onPress={() => void presetSetup($, PRESETS[0]!.draft)} />
-          <Button key="cancel" label="Cancel" role="dismiss" onPress={() => void $.ui.close({ id: SETUP })} />
-        </Box>
-        <Text dimColor>Tab moves, Enter picks, Esc closes without saving.</Text>
+        <Text dimColor wrap="wrap">Save writes your Claude Code settings, like /config · Tab moves · Esc closes without saving</Text>
       </Box>
     )
   })

@@ -1,6 +1,6 @@
 {
   "name": "cache-countdown",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Prompt-cache meter above the prompt: hit %, read/wrote/new tokens, a TTL countdown and advice (warm, soon, expired, miss, off). /cache opens a pane with a countdown bar, the last request's stacked bar and a per-turn table; /cache setup is a settings wizard. Configurable tick rate: once a minute by default, every second in the final minute.",
   "types": "./types/index.d.ts",
   "author": {

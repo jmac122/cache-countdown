@@ -19,17 +19,17 @@ export const FIELDS: Field[] = [
     key: 'ttl',
     label: 'Cache lifetime',
     choices: [
-      { value: 'auto', label: 'auto: follow Claude Code (recommended)' },
-      { value: '1h', label: '1h: pin one hour' },
-      { value: '5m', label: '5m: pin five minutes' },
+      { value: 'auto', label: 'auto · default' },
+      { value: '1h', label: '1h (pinned)' },
+      { value: '5m', label: '5m (pinned)' },
     ],
   },
   {
     key: 'tickSeconds',
     label: 'Countdown step',
     choices: [
-      { value: 60, label: 'every minute, "59m" (recommended)' },
-      { value: 10, label: 'every 10 seconds' },
+      { value: 60, label: 'every minute, "59m" · default' },
+      { value: 10, label: 'every 10 s' },
       { value: 1, label: 'every second, "59:42"' },
     ],
   },
@@ -37,38 +37,38 @@ export const FIELDS: Field[] = [
     key: 'warnSeconds',
     label: 'Final stretch',
     choices: [
-      { value: 30, label: 'last 30 seconds' },
-      { value: 60, label: 'last 60 seconds (recommended)' },
-      { value: 120, label: 'last 2 minutes' },
-      { value: 300, label: 'last 5 minutes' },
+      { value: 30, label: 'last 30 s' },
+      { value: 60, label: 'last 60 s · default' },
+      { value: 120, label: 'last 2 min' },
+      { value: 300, label: 'last 5 min' },
     ],
   },
   {
     key: 'finalTickSeconds',
     label: 'Final stretch step',
     choices: [
-      { value: 1, label: 'every second (recommended)' },
-      { value: 5, label: 'every 5 seconds' },
-      { value: 10, label: 'every 10 seconds' },
+      { value: 1, label: 'every second · default' },
+      { value: 5, label: 'every 5 s' },
+      { value: 10, label: 'every 10 s' },
     ],
   },
   {
     key: 'toasts',
-    label: 'Expiry toasts',
+    label: 'Toasts at',
     choices: [
-      { value: '1m,10s,5s,1s', label: 'at 1 min, 10 s, 5 s and 1 s left (recommended)' },
-      { value: '30m,15m,5m,1m', label: 'at 30, 15, 5 and 1 min left' },
-      { value: '5m,2m,1m', label: 'at 5, 2 and 1 min left' },
-      { value: '1m', label: 'once, at 1 min left' },
+      { value: '1m,10s,5s,1s', label: '1m, 10s, 5s, 1s · default' },
+      { value: '30m,15m,5m,1m', label: '30m, 15m, 5m, 1m' },
+      { value: '5m,2m,1m', label: '5m, 2m, 1m' },
+      { value: '1m', label: '1m only' },
       { value: 'off', label: 'off' },
     ],
   },
   {
     key: 'toastMinTokens',
-    label: 'Toast only from',
+    label: 'Toast from prompt size',
     choices: [
-      { value: 0, label: 'any prompt size' },
-      { value: 20_000, label: '20k tokens (recommended)' },
+      { value: 0, label: 'any size' },
+      { value: 20_000, label: '20k tokens · default' },
       { value: 50_000, label: '50k tokens' },
       { value: 100_000, label: '100k tokens' },
     ],
@@ -78,23 +78,23 @@ export const FIELDS: Field[] = [
     label: 'Suggest /compact from',
     choices: [
       { value: 50_000, label: '50k tokens' },
-      { value: 100_000, label: '100k tokens (recommended)' },
+      { value: 100_000, label: '100k tokens · default' },
       { value: 200_000, label: '200k tokens' },
     ],
   },
   {
     key: 'band',
-    label: 'Meter row above the input box',
+    label: 'Meter above input box',
     choices: [
-      { value: true, label: 'on (recommended)' },
+      { value: true, label: 'on · default' },
       { value: false, label: 'off' },
     ],
   },
   {
     key: 'status',
-    label: 'Footer line beside your statusline',
+    label: 'Footer line',
     choices: [
-      { value: false, label: 'off (recommended)' },
+      { value: false, label: 'off · default' },
       { value: true, label: 'on' },
     ],
   },
@@ -115,16 +115,18 @@ export const DEFAULTS: SetupDraft = {
 
 export type PresetKey = 'recommended' | 'quiet' | 'live'
 
-export const PRESETS: { key: PresetKey; label: string; draft: SetupDraft }[] = [
-  { key: 'recommended', label: 'Recommended: minute steps, seconds in the last minute, 4 toasts', draft: DEFAULTS },
+export const PRESETS: { key: PresetKey; label: string; about: string; draft: SetupDraft }[] = [
+  { key: 'recommended', label: 'Recommended', about: 'minute steps, seconds in the last minute, 4 toasts', draft: DEFAULTS },
   {
     key: 'quiet',
-    label: 'Quiet: band only, minute steps, no toasts',
+    label: 'Quiet',
+    about: 'meter only, minute steps, no toasts',
     draft: { ...DEFAULTS, finalTickSeconds: 10, toasts: 'off' },
   },
   {
     key: 'live',
-    label: 'Live: per-second countdown, status entry, early toasts',
+    label: 'Live',
+    about: 'per-second countdown, footer line, toasts at 5m, 2m, 1m',
     draft: { ...DEFAULTS, tickSeconds: 1, toasts: '5m,2m,1m', status: true },
   },
 ]
