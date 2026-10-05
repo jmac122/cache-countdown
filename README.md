@@ -8,8 +8,10 @@ A prompt-cache meter for Claude Code, written as a mod (function hooks).
 
 - **Meter row above the input box**: hit %, read / wrote / new tokens, the time left on the cache, and advice: `warm`, `soon`, `expired` (suggests `/compact` on big contexts), `miss` (names the cause: model changed, cache lapsed, prefix changed), `off`.
 - **`/cache`**: a pane with the countdown bar, the last request as a stacked read/wrote/new bar, and a per-turn table with a totals row. `/cache stop`, Esc or `[ close ]` closes it.
-- **`/cache setup`**: a settings wizard with presets (Recommended, Quiet, Live) and one picker per setting. Save writes your Claude Code settings the same way `/config` does, and the mod reloads with them.
-- **Toasts** before the cache expires (default at 1 min, 10 s, 5 s and 1 s left; set any times you like, e.g. `30m, 15m, 5m, 1m`), only for prompts big enough to matter.
+- **`/cache setup`**: a step-by-step walkthrough. Start from a preset (Recommended, Quiet, Live), then one step per setting that explains what it is for, with a hint on each choice and a `custom…` field where a list makes sense. A review page shows everything; Save writes your Claude Code settings the same way `/config` does, and the mod reloads with them.
+- **Cache expiry toasts** before the cache expires (default at 1 min, 10 s, 5 s and 1 s left; set any times you like, e.g. `30m, 15m, 5m, 1m`).
+- **Context window alerts**, separate from the cache: a toast as the conversation crosses fill levels of the model's context window (default 50%, 25% and 10% remaining), for anyone whose status line doesn't show context usage. They re-arm after `/compact` or `/clear`.
+- Toasts are drawn inside Claude Code (top-right corner, about 4 s), not in the Windows or macOS notification center.
 - **Footer line** (optional): `cache 86% · 59m` on its own line under the input box, beside your statusline.
 
 ## Install
@@ -57,7 +59,7 @@ Use `/cache setup`, the `/config` menu, or `~/.claude/settings.json` under `plug
 | `finalTickSeconds` | 1 | countdown step inside the final stretch |
 | `toast` | true | expiry toasts on/off |
 | `toastAt` | `1m,10s,5s,1s` | times left at which a toast fires, once each per cache entry, with units: `30m, 15m, 5m, 1m`, `5m, 2m, 1m`, `90s`, `1h` (a bare number is seconds). Keep marks at least 3 s apart: Claude Code drops a toast that comes within 2 s of the previous one |
-| `toastWhenRemainingPct` | 100 | expiry toasts fire only once the context window remaining is at or below this % (100 = always) |
+| `contextAlertsAt` | `50,25,10` | a toast each time the conversation crosses one of these levels of the context window (% remaining); `off` disables. Independent of the cache toasts |
 | `compactWhenRemainingPct` | 60 | once the window remaining is at or below this %, an expired cache suggests `/compact` instead of "keep going" (60 = 400k used on a 1M window, 80k on 200k) |
 | `band` | true | the meter row above the input box |
 | `status` | false | a short footer line beside your statusline |

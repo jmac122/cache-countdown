@@ -1,7 +1,7 @@
 {
   "name": "cache-countdown",
-  "version": "0.2.2",
-  "description": "Prompt-cache meter above the prompt: hit %, read/wrote/new tokens, a TTL countdown and advice (warm, soon, expired, miss, off). /cache opens a pane with a countdown bar, the last request's stacked bar and a per-turn table; /cache setup is a settings wizard. Configurable tick rate: once a minute by default, every second in the final minute.",
+  "version": "0.2.3",
+  "description": "Prompt-cache meter above the input box: hit %, read/wrote/new tokens, a TTL countdown and advice; cache-expiry toasts and context-window alerts. /cache opens a detail pane; /cache setup walks through every setting.",
   "types": "./types/index.d.ts",
   "author": {
     "name": "jmac122",
@@ -75,11 +75,11 @@
       "description": "Comma-separated times left at which a toast fires, with units: 30m,15m,5m,1m or 1m,10s,5s,1s (h, m, s; a bare number is seconds). Keep marks at least 3 s apart: Claude Code drops a toast within 2 s of the previous one",
       "default": "1m,10s,5s,1s"
     },
-    "toastWhenRemainingPct": {
-      "type": "number",
-      "title": "Toast when window remaining ≤ (%)",
-      "description": "Expiry toasts fire only once the context window remaining is at or below this percentage. 100 = always; 75 = only after a quarter of the window is used",
-      "default": 100
+    "contextAlertsAt": {
+      "type": "string",
+      "title": "Context alerts at (% of window remaining)",
+      "description": "A toast each time the conversation crosses one of these fill levels of the context window, e.g. 50,25,10 → \"context: 25% of window remaining\". \"off\" disables. Independent of the cache-expiry toasts",
+      "default": "50,25,10"
     }
   },
   "homepage": "https://github.com/jmac122/cache-countdown",

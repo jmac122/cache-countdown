@@ -228,6 +228,31 @@ export function parseMarks(v: unknown, fallback: readonly number[] = DEFAULT_TOA
   return marks.length ? marks.sort((a, b) => b - a) : [...fallback]
 }
 
+/** Default context-alert levels, % of the window remaining. */
+export const DEFAULT_CONTEXT_ALERTS = [50, 25, 10]
+
+/** "75,50,25" → [75, 50, 25]: whole percentages 1–99, unique, largest first; "off" or "" → []; nothing valid → fallback. */
+export function parsePercents(v: unknown, fallback: readonly number[] = DEFAULT_CONTEXT_ALERTS): number[] {
+  if (typeof v !== 'string') return [...fallback]
+  const text = v.trim().toLowerCase()
+  if (text === '' || text === 'off' || text === 'none') return []
+  const marks = [...new Set(text.split(/[,;\s]+/).map(t => Number(t.replace('%', ''))).filter(n => Number.isFinite(n) && n > 0 && n < 100).map(n => Math.round(n)))]
+  return marks.length ? marks.sort((a, b) => b - a) : [...fallback]
+}
+
+/**
+ * Context alerts: given the % of window remaining, the levels and those
+ * already announced, which level to announce now (the lowest newly crossed,
+ * once) and the updated announced set. A level whose line the context has
+ * moved back above (after /compact or /clear) is re-armed.
+ */
+export function contextAlert(remaining: number, levels: readonly number[], announced: readonly number[]): { level?: number; announced: number[] } {
+  const kept = announced.filter(m => remaining <= m)
+  const due = levels.filter(m => remaining <= m && !kept.includes(m))
+  if (!due.length) return { announced: kept }
+  return { level: Math.min(...due), announced: [...kept, ...due].sort((a, b) => b - a) }
+}
+
 /** Time left in words for a toast: "30 min", "1 hr", "1:30", "10s". */
 export function fmtSpan(secs: number): string {
   if (secs >= 3600 && secs % 3600 === 0) return `${secs / 3600} hr`

@@ -318,21 +318,30 @@ describe('pace and toasts are configurable', () => {
     expect(w.toasts[1]).toContain('5s')
   })
 
-  test('toastWhenRemainingPct gates toasts by window remaining', { options: { toastWhenRemainingPct: 75, toastAt: '10s' } }, async ($, on) => {
-    // 81.3k of a 1M window: 92% remaining, above 75%, so no toast
-    const big = world(on, { window: 1_000_000 })
+  test('context alerts: one toast as the window crosses levels, not repeated', async ($, on) => {
+    // 81.3k of a 100k window: 19% remaining, past 50% and 25% at once, so one toast for 25%
+    const w = world(on, { window: 100_000 })
     await start($)
     await step($)
-    await big.clock.advance(301_000)
-    expect(big.toasts).toEqual([])
+    await step($, { index: 1 })
+    const alerts = w.toasts.filter(t => t.startsWith('context:'))
+    expect(alerts).toEqual(['context: 19% of window remaining (81.3k of 100k used) · /compact or /clear frees room'])
   })
 
-  test('the same prompt on a 100k window (19% remaining) toasts', { options: { toastWhenRemainingPct: 75, toastAt: '10s' } }, async ($, on) => {
-    const small = world(on, { window: 100_000 })
+  test('context alerts stay quiet with plenty of room, and are independent of cache toasts', { options: { toastAt: '10s' } }, async ($, on) => {
+    const w = world(on, { window: 1_000_000 })
     await start($)
     await step($)
-    await small.clock.advance(301_000)
-    expect(small.toasts.length).toBe(1)
+    await w.clock.advance(301_000)
+    expect(w.toasts.filter(t => t.startsWith('context:'))).toEqual([])
+    expect(w.toasts.filter(t => t.startsWith('cache expires')).length).toBe(1)
+  })
+
+  test('contextAlertsAt off disables them', { options: { contextAlertsAt: 'off' } }, async ($, on) => {
+    const w = world(on, { window: 100_000 })
+    await start($)
+    await step($)
+    expect(w.toasts.filter(t => t.startsWith('context:'))).toEqual([])
   })
 
   test('/compact advice follows window remaining, and says how much is left', async ($, on) => {
@@ -371,59 +380,66 @@ describe('toasts in minutes', () => {
   })
 })
 
-describe('setup wizard', () => {
+describe('setup walkthrough', () => {
   test('pure: draft from options, toast row, changes', () => {
-    const d = draftFromOptions({ ttl: 'auto', tickSeconds: 60, warnSeconds: 60, finalTickSeconds: 1, toast: true, toastAt: '1m,10s,5s,1s', toastWhenRemainingPct: 100, compactWhenRemainingPct: 60, band: true, status: false })
+    const d = draftFromOptions({ ttl: 'auto', tickSeconds: 60, warnSeconds: 60, finalTickSeconds: 1, toast: true, toastAt: '1m,10s,5s,1s', contextAlertsAt: '50,25,10', compactWhenRemainingPct: 60, band: true, status: false })
     expect(d).toEqual(PRESETS[0]!.draft)
     expect(toastsRow(false, '60')).toBe('off')
     expect(splitToasts('off')).toEqual({ toast: false })
     const quiet = PRESETS.find(p => p.key === 'quiet')!.draft
-    expect(changes(quiet, { ...d, toast: true, toastAt: '60,10,3,1' })).toEqual([
+    expect(changes(quiet, { ...d, toast: true, toastAt: '1m,10s,5s,1s' })).toEqual([
       { key: 'finalTickSeconds', value: 10 },
       { key: 'toast', value: false },
+      { key: 'contextAlertsAt', value: 'off' },
     ])
   })
 
-  test('/cache setup → pick a preset → Save writes only the changed settings through config.set', async ($, on) => {
-    const w = world(on)
-    const written: { key: string; value: unknown }[] = []
-    on('config.set', ($, e) => {
-      written.push({ key: e.key, value: e.value })
-      return { value: e.value } as never
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(surface + ': preset step, skip to review, Save writes only what changed', async ($, on) => {
+      const w = world(on)
+      const written: { key: string; value: unknown }[] = []
+      on('config.set', ($, e) => {
+        written.push({ key: e.key, value: e.value })
+        return { value: e.value } as never
+      })
+      await start($)
+      const r = await $.command.run({ command: 'cache', args: 'setup' } as never)
+      expect((r as { text: string }).text).toContain('setup opened')
+      const pane = await $.ui.mount({ plugin: 'cache-countdown', surface, component: 'Pane', requestId: 'cache-setup', props: { title: 'cache setup', isFocused: true, bodyColumns: 80, placement: 'dock' } as never })
+      expect(await pane.find({ type: 'Text', text: /step 1 of 11/ })).toBeDefined()
+      expect(await pane.find({ type: 'Text', text: /Start from a preset/ })).toBeDefined()
+      await pane.press({ key: 'pick:preset:live' })
+      await pane.press({ key: 'review' })
+      expect(await pane.find({ type: 'Text', text: /Review and save/ })).toBeDefined()
+      expect(await pane.find({ type: 'Button', key: 'save', text: /Save 4 changes/ })).toBeDefined()
+      await pane.press({ key: 'save' })
+      await pane.unmount()
+      expect(written).toEqual([
+        { key: 'cache-countdown.tickSeconds', value: 1 },
+        { key: 'cache-countdown.toastAt', value: '5m,2m,1m' },
+        { key: 'cache-countdown.contextAlertsAt', value: '75,50,25,10,5' },
+        { key: 'cache-countdown.status', value: true },
+      ])
+      expect(w.toasts.at(-1)).toContain('tickSeconds = 1')
     })
-    await start($)
-    const r = await $.command.run({ command: 'cache', args: 'setup' } as never)
-    expect((r as { text: string }).text).toContain('setup opened')
-    const pane = await $.ui.mount({ plugin: 'cache-countdown', surface: 'terminal', component: 'Pane', requestId: 'cache-setup', props: { title: 'cache setup', isFocused: true, bodyColumns: 80, placement: 'dock' } as never })
-    expect(await pane.find({ type: 'Text', text: /cache-countdown setup/ })).toBeDefined()
-    expect(await pane.find({ type: 'Button', key: 'pick:tickSeconds:60' })).toBeDefined()
-    await pane.press({ key: 'pick:preset:live' })
-    expect(await pane.find({ type: 'Button', key: 'save', text: /Save 3 changes/ })).toBeDefined()
-    await pane.press({ key: 'save' })
-    await pane.unmount()
-    expect(written).toEqual([
-      { key: 'cache-countdown.tickSeconds', value: 1 },
-      { key: 'cache-countdown.toastAt', value: '5m,2m,1m' },
-      { key: 'cache-countdown.status', value: true },
-    ])
-    expect(w.toasts.at(-1)).toContain('tickSeconds = 1')
-  })
+  }
 
-  test('a denied write is reported, not swallowed', async ($, on) => {
-    const w = world(on)
-    on('config.set', () => ({ deny: 'locked by managed settings' }) as never)
+  test('each step explains its setting; Next and Back walk the steps', async ($, on) => {
+    world(on)
     await start($)
     await $.command.run({ command: 'cache', args: 'setup' } as never)
     const pane = await $.ui.mount({ plugin: 'cache-countdown', surface: 'terminal', component: 'Pane', requestId: 'cache-setup', props: { title: 'cache setup', isFocused: true, bodyColumns: 80, placement: 'dock' } as never })
-    await pane.press({ key: 'pick:status:true' })
-    await pane.press({ key: 'save' })
+    await pane.press({ key: 'next' })
+    expect(await pane.find({ type: 'Text', text: /step 2 of 11/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^Cache lifetime$/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /Claude caches the start of your conversation/ })).toBeDefined()
+    expect(await pane.find({ type: 'Button', key: 'pick:ttl:auto' })).toBeDefined()
+    await pane.press({ key: 'back' })
+    expect(await pane.find({ type: 'Text', text: /step 1 of 11/ })).toBeDefined()
     await pane.unmount()
-    expect(w.toasts.at(-1)).toContain('status not saved (locked by managed settings)')
   })
-})
 
-describe('setup wizard on desktop', () => {
-  test('desktop keeps native dropdowns, aligned, and saves the pick', async ($, on) => {
+  test('custom… opens a text field; what you type is cleaned and saved', async ($, on) => {
     world(on)
     const written: { key: string; value: unknown }[] = []
     on('config.set', ($, e) => {
@@ -432,13 +448,53 @@ describe('setup wizard on desktop', () => {
     })
     await start($)
     await $.command.run({ command: 'cache', args: 'setup' } as never)
-    const pane = await $.ui.mount({ plugin: 'cache-countdown', surface: 'desktop', component: 'Pane', requestId: 'cache-setup', props: { title: 'cache setup', isFocused: true, bodyColumns: 120, placement: 'dock' } as never })
-    expect(await pane.find({ type: 'Select', key: 'compactWhenRemainingPct' })).toBeDefined()
-    expect(await pane.find({ type: 'Text', text: /COUNTDOWN/ })).toBeDefined()
-    await pane.select({ key: 'compactWhenRemainingPct', value: '40' })
+    const pane = await $.ui.mount({ plugin: 'cache-countdown', surface: 'terminal', component: 'Pane', requestId: 'cache-setup', props: { title: 'cache setup', isFocused: true, bodyColumns: 80, placement: 'dock' } as never })
+    await pane.press({ key: 'review' })
+    await pane.press({ key: 'edit:toasts' })
+    expect(await pane.find({ type: 'Text', text: /^Cache expiry toasts$/ })).toBeDefined()
+    await pane.press({ key: 'pick:toasts:__custom' })
+    await pane.input({ key: 'in:toasts', text: '45m, 20m, junk, 2m' })
+    await pane.press({ key: 'review' })
+    expect(await pane.find({ type: 'Button', key: 'edit:toasts', text: /custom: 45m,20m,2m/ })).toBeDefined()
+    await pane.press({ key: 'edit:contextAlertsAt' })
+    await pane.press({ key: 'pick:contextAlertsAt:__custom' })
+    await pane.input({ key: 'in:contextAlertsAt', text: '75, 50, 25, 10, 5' })
+    await pane.press({ key: 'review' })
     await pane.press({ key: 'save' })
     await pane.unmount()
-    expect(written).toEqual([{ key: 'cache-countdown.compactWhenRemainingPct', value: 40 }])
+    expect(written).toEqual([
+      { key: 'cache-countdown.toastAt', value: '45m,20m,2m' },
+      { key: 'cache-countdown.contextAlertsAt', value: '75,50,25,10,5' },
+    ])
+  })
+
+  test('text typed but not submitted is kept when you move on', async ($, on) => {
+    world(on)
+    await start($)
+    await $.command.run({ command: 'cache', args: 'setup' } as never)
+    const pane = await $.ui.mount({ plugin: 'cache-countdown', surface: 'terminal', component: 'Pane', requestId: 'cache-setup', props: { title: 'cache setup', isFocused: true, bodyColumns: 80, placement: 'dock' } as never })
+    await pane.press({ key: 'review' })
+    await pane.press({ key: 'edit:toasts' })
+    await pane.press({ key: 'pick:toasts:__custom' })
+    await pane.input({ key: 'in:toasts', text: '45m, 20m, 2m', kind: 'change' })
+    await pane.press({ key: 'review' })
+    expect(await pane.find({ type: 'Button', key: 'edit:toasts', text: /custom: 45m,20m,2m/ })).toBeDefined()
+    await pane.unmount()
+  })
+
+  test('a denied write is reported, not swallowed', async ($, on) => {
+    const w = world(on)
+    on('config.set', () => ({ deny: 'locked by managed settings' }) as never)
+    await start($)
+    await $.command.run({ command: 'cache', args: 'setup' } as never)
+    const pane = await $.ui.mount({ plugin: 'cache-countdown', surface: 'terminal', component: 'Pane', requestId: 'cache-setup', props: { title: 'cache setup', isFocused: true, bodyColumns: 80, placement: 'dock' } as never })
+    await pane.press({ key: 'review' })
+    await pane.press({ key: 'edit:status' })
+    await pane.press({ key: 'pick:status:true' })
+    await pane.press({ key: 'review' })
+    await pane.press({ key: 'save' })
+    await pane.unmount()
+    expect(w.toasts.at(-1)).toContain('status not saved (locked by managed settings)')
   })
 })
 

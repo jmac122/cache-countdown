@@ -36,6 +36,10 @@ declare module 'claude-code' {
       setupNote: string
       /** settings the wizard still has to write: one is written per load, since each write reloads the mod */
       pending: SetupChange[]
+      /** the walkthrough's current step (0 = preset, last = review) */
+      setupStep: number
+      /** context-alert levels (% of window remaining) already announced; a level re-arms once the context drops back above it */
+      alerted: number[]
     }
   }
 }

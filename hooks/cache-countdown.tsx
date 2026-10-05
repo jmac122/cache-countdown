@@ -14,12 +14,15 @@
  *   - samples and the observed TTL live in $.state, so a hot reload keeps them
  *
  * Options: ttl auto|5m|1h, warnSeconds, tickSeconds, finalTickSeconds, compactWhenRemainingPct,
- *          band, status, toast, toastAt, toastWhenRemainingPct.
+ *          band, status, toast, toastAt, contextAlertsAt.
  */
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 import {
   accountOf,
+  contextAlert,
+  parsePercents,
+  remainingPct,
   DEFAULT_WINDOW,
   pctOption,
   usedAt,
@@ -48,7 +51,7 @@ import {
   URGENT_SECS,
 } from './cache'
 import type { Advice, CacheEnv, Pace, Sample, TtlChoice, Ttl } from './cache'
-import { changes, choicesFor, decode, draftFromOptions, encode, FIELDS, LABEL_WIDTH, PRESETS, SECTIONS } from './setup'
+import { changes, CUSTOM, decode, display, draftFromOptions, encode, FIELDS, isListed, PRESETS, REVIEW_STEP, STEP_COUNT } from './setup'
 import type { Field } from './setup'
 import type { SetupChange, SetupDraft } from './setup'
 
@@ -64,6 +67,8 @@ const paneAtom = atom({ plugin: 'cache-countdown', key: 'paneOpen' } as const, f
 const draftAtom = atom({ plugin: 'cache-countdown', key: 'draft' } as const, null)
 const noteAtom = atom({ plugin: 'cache-countdown', key: 'setupNote' } as const, '')
 const pendingAtom = atom({ plugin: 'cache-countdown', key: 'pending' } as const, [])
+const stepAtom = atom({ plugin: 'cache-countdown', key: 'setupStep' } as const, 0)
+const alertedAtom = atom({ plugin: 'cache-countdown', key: 'alerted' } as const, [])
 
 const COLOR: Record<Advice['kind'], string | undefined> = {
   warm: 'green',
@@ -82,8 +87,8 @@ type Config = {
   warnMs: number
   pace: Pace
   toastAt: number[]
-  /** toasts fire only once the window remaining is at or below this percentage (100 = always) */
-  toastWhenRemainingPct: number
+  /** context-window alert levels, % of the window remaining; [] = off */
+  contextAlerts: number[]
   /** an expired cache suggests /compact once the window remaining is at or below this percentage */
   compactWhenRemainingPct: number
   showBand: boolean
@@ -98,7 +103,7 @@ let cfg: Config = {
   warnMs: 60_000,
   pace: { tickMs: 60_000, finalTickMs: 1_000, warnMs: 60_000 },
   toastAt: parseMarks(undefined),
-  toastWhenRemainingPct: 100,
+  contextAlerts: [50, 25, 10],
   compactWhenRemainingPct: 60, showBand: true, showStatus: false, wantToast: true, pinned: false, ttlOption: 'auto' }
 let env: CacheEnv = {}
 let setting: unknown
@@ -165,7 +170,8 @@ async function tick($: EngineInterface) {
         $.ui.status(line)
       }
     }
-    const toasting = cfg.wantToast && !!s.last && s.left > 0 && promptTokens(s.last) >= usedAt(windowTokens || DEFAULT_WINDOW, cfg.toastWhenRemainingPct)
+    // cache-expiry toasts are independent of the context window: they fire at the marks whenever toasts are on
+    const toasting = cfg.wantToast && !!s.last && s.left > 0
     if (toasting && s.last) {
       if (toastedFor !== s.last.startedAt) {
         toastedFor = s.last.startedAt
@@ -224,11 +230,13 @@ async function applyPending($: EngineInterface) {
 async function openSetup($: EngineInterface) {
   await update($, draftAtom, () => draftFromOptions(current))
   await update($, noteAtom, () => '')
+  await update($, stepAtom, () => 0)
   await $.ui.open({ id: SETUP, title: 'cache setup', focus: true, closeOnEscape: true, columns: 76, rows: 22 })
   await $.store.set('setupSeen', true).catch(() => undefined)
 }
 
 async function saveSetup($: EngineInterface) {
+  await commitTyping($)
   const draft = ((await read($, draftAtom)) as SetupDraft | null) ?? draftFromOptions(current)
   const todo = changes(draft, current)
   await $.ui.close({ id: SETUP }).catch(() => undefined)
@@ -244,6 +252,37 @@ async function saveSetup($: EngineInterface) {
 
 async function pickSetup($: EngineInterface, key: string, value: string | number | boolean) {
   await update($, draftAtom, d => ({ ...((d as SetupDraft | null) ?? draftFromOptions(current)), [key]: value }))
+}
+
+/** custom…: mark the step custom and put the keyboard in its text field (focus waits for the field to be drawn) */
+async function startCustom($: EngineInterface, key: string) {
+  await update($, draftAtom, d => ({ ...((d as SetupDraft | null) ?? draftFromOptions(current)), [`${key}:custom`]: true }))
+  await $.ui.focus({ requestId: SETUP, key: `in:${key}` }).catch(() => undefined)
+}
+
+// text typed into a custom field and not yet committed: held here so typing never redraws (a redraw per key resets the field)
+const typing = new Map<string, string>()
+
+/** Commit a custom field's text: the raw text for the field, and the cleaned value when it is valid. */
+async function typeCustom($: EngineInterface, key: string, raw: string) {
+  typing.delete(key)
+  const clean = FIELDS.find(f => f.key === key)?.custom?.normalize(raw)
+  await update($, draftAtom, d => ({
+    ...((d as SetupDraft | null) ?? draftFromOptions(current)),
+    [`${key}:text`]: raw,
+    [`${key}:custom`]: true,
+    ...(clean !== undefined ? { [key]: clean } : {}),
+  }))
+}
+
+/** Before leaving a step (Next, Back, review, Save): commit whatever is still being typed. */
+async function commitTyping($: EngineInterface) {
+  for (const [key, raw] of [...typing]) await typeCustom($, key, raw)
+}
+
+async function gotoStep($: EngineInterface, step: number) {
+  await commitTyping($)
+  await update($, stepAtom, () => Math.max(0, Math.min(REVIEW_STEP, step)))
 }
 
 async function presetSetup($: EngineInterface, draft: SetupDraft) {
@@ -269,7 +308,7 @@ export const register: Register = (on, options) => {
       warnMs: warnMsOpt,
     },
     toastAt: parseMarks(options.toastAt),
-    toastWhenRemainingPct: pctOption(options.toastWhenRemainingPct, 100),
+    contextAlerts: parsePercents(options.contextAlertsAt),
     compactWhenRemainingPct: pctOption(options.compactWhenRemainingPct, 60),
     showBand: options.band !== false,
     showStatus: options.status === true,
@@ -331,6 +370,7 @@ export const register: Register = (on, options) => {
       // /clear starts a new conversation: a new cache
       await update($, samplesAtom, () => [])
       await update($, observedAtom, () => null)
+      await update($, alertedAtom, () => [])
       toastedFor = 0
       toastLevel = Infinity
       if (showStatus) {
@@ -370,6 +410,18 @@ export const register: Register = (on, options) => {
       const seen = observeTtl(prev, sample, known)
       if (seen !== known) await update($, observedAtom, () => seen ?? null)
     }
+    // context-window alerts: a toast as the conversation crosses each fill level, independent of the cache
+    if (windowTokens > 0 && cfg.contextAlerts.length) {
+      const used = promptTokens(sample)
+      const left = remainingPct(used, windowTokens)
+      const announced = (await read($, alertedAtom)) as number[]
+      const alert = contextAlert(left, cfg.contextAlerts, announced)
+      if (alert.announced.join() !== announced.join()) await update($, alertedAtom, () => alert.announced)
+      if (alert.level !== undefined) {
+        const tight = left <= cfg.compactWhenRemainingPct ? ' · /compact or /clear frees room' : ''
+        $.ui.toast(`context: ${left}% of window remaining (${fmtTokens(used)} of ${fmtTokens(windowTokens)} used)${tight}`)
+      }
+    }
     $.ui.log(
       `cache-countdown: step read=${sample.read} write=${sample.write} new=${sample.fresh} model=${sample.model} ttl=${base.ttl} (${base.source}) window=${windowTokens}`,
       { to: 'debug' },
@@ -405,6 +457,7 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'Pane', requestId: SETUP }, async ($, e) => {
     const draft = ((await read($, draftAtom)) as SetupDraft | null) ?? draftFromOptions(current)
+    const step = Math.max(0, Math.min(REVIEW_STEP, (await read($, stepAtom)) as number))
     const s = await snapshot($, await $.clock.now())
     if (e.surface === 'mobile') {
       const { Box, Text } = $.ui.resolve(e)
@@ -415,96 +468,114 @@ export const register: Register = (on, options) => {
         </Box>
       )
     }
-    const { Box, Text, Button, Select } = $.ui.resolve(e)
+    const { Box, Text, Button, Input } = $.ui.resolve(e)
     const terminal = e.surface === 'terminal'
-    // room for headings and spacing everywhere but the terminal's inline pane, whose height Claude Code caps
-    const roomy = !terminal || e.props.placement === 'dock'
-    const gap = roomy ? 1 : 0
-    // HTML collapses runs of spaces; a no-break space keeps chip padding on desktop
-    const sp = (t: string) => (terminal ? t : t.replace(/ /g, '\u00a0'))
-    const preset = PRESETS.find(p => FIELDS.every(f => encode(p.draft[f.key] ?? '') === encode(draft[f.key] ?? '')))
+    // breathing room everywhere but the terminal's inline pane, whose height Claude Code caps
+    const gap = !terminal || e.props.placement === 'dock' ? 1 : 0
     const count = changes(draft, current).length
+    const preset = PRESETS.find(p => FIELDS.every(f => encode(p.draft[f.key] ?? '') === encode(draft[f.key] ?? '')))
 
-    // terminal: every choice is a chip you can click; the selected one sits on the accent colour
-    const chips = (key: string, items: { value: string; text: string }[], selected: string, pick: (value: string) => void) => (
-      <Box key={`chips:${key}`} flexDirection="row" columnGap={1} flexWrap="wrap">
-        {items.map(item => {
-          const isPicked = item.value === selected
-          return (
-            <Box key={`chip:${key}:${item.value}`} backgroundColor={isPicked ? 'cyan' : 'gray'}>
-              <Button key={`pick:${key}:${item.value}`} plain label={` ${item.text} `} onPress={() => pick(item.value)} />
-            </Box>
-          )
-        })}
+    // one choice: a button that is the click target, ● on the picked one in the accent colour, a dim hint beside it
+    const option = (key: string, label: string, hint: string | undefined, picked: boolean, onPress: () => void) => (
+      <Box key={`opt:${key}`} flexDirection="row" columnGap={1}>
+        <Button key={`pick:${key}`} label={`${picked ? '●' : '○'} ${label}`} variant={picked ? 'primary' : undefined} onPress={onPress} />
+        {hint ? <Text dimColor wrap="wrap">{hint}</Text> : null}
       </Box>
     )
-    const labelled = (key: string, label: string, control: unknown) => (
-      <Box key={`row:${key}`} flexDirection="row">
-        <Box width={LABEL_WIDTH} flexShrink={0}>
-          <Text>{sp(label)}</Text>
+    const heading = (title: string) => (
+      <Box key="head" flexDirection="column">
+        <Text dimColor>{`cache-countdown setup · step ${step + 1} of ${STEP_COUNT}`}</Text>
+        <Text bold color="cyan">{title}</Text>
+      </Box>
+    )
+    const help = (lines: string[]) => (
+      <Box key="help" flexDirection="column" marginTop={gap}>
+        {lines.map((line, i) => (
+          <Text key={`help:${i}`} wrap="wrap">{line}</Text>
+        ))}
+      </Box>
+    )
+    const nav = (
+      <Box key="nav" flexDirection="row" columnGap={2} marginTop={gap}>
+        {step > 0 ? <Button key="back" label="Back" onPress={() => void gotoStep($, step - 1)} /> : null}
+        {step < REVIEW_STEP ? (
+          <Button key="next" label="Next" variant="primary" onPress={() => void gotoStep($, step + 1)} />
+        ) : (
+          <Button key="save" label={count ? `Save ${count} change${count === 1 ? '' : 's'}` : 'Save'} variant="primary" onPress={() => void saveSetup($)} />
+        )}
+        {step < REVIEW_STEP ? <Button key="review" label="Skip to review" onPress={() => void gotoStep($, REVIEW_STEP)} /> : null}
+        <Button key="cancel" label="Cancel" role="dismiss" onPress={() => void $.ui.close({ id: SETUP })} />
+      </Box>
+    )
+
+    if (step === 0) {
+      return (
+        <Box flexDirection="column">
+          {heading('Start from a preset')}
+          {help([
+            'cache-countdown shows how much of each request Claude served from its prompt cache, and counts down to when that cache expires.',
+            'Pick a starting point. The next steps explain each setting so you can adjust it, or skip straight to the review.',
+          ])}
+          <Box key="choices" flexDirection="column" marginTop={gap}>
+            {PRESETS.map(p => option(`preset:${p.key}`, p.label, p.about, preset?.key === p.key, () => void presetSetup($, p.draft)))}
+            {preset ? null : <Text key="own" dimColor>{'● your own picks (keep them, or choose a preset)'}</Text>}
+          </Box>
+          {nav}
         </Box>
-        {control as never}
-      </Box>
-    )
-    const fieldRow = (f: Field) => {
-      const choices = choicesFor(f, draft[f.key])
-      const selected = encode(draft[f.key] ?? '')
-      const control = terminal
-        ? chips(f.key, choices.map(c => ({ value: encode(c.value), text: c.short ?? c.label })), selected, v => void pickSetup($, f.key, decode(f, v)))
-        : (
-            <Select
-              key={f.key}
-              options={choices.map(c => ({ value: encode(c.value), label: c.label }))}
-              value={selected}
-              onSelect={v => void pickSetup($, f.key, decode(f, v))}
-            />
-          )
-      return labelled(f.key, f.label, control)
+      )
     }
-    const presetControl = terminal
-      ? chips('preset', PRESETS.map(p => ({ value: p.key, text: p.label })), preset?.key ?? 'custom', v => {
-          const p = PRESETS.find(x => x.key === v)
-          if (p) void presetSetup($, p.draft)
-        })
-      : (
-          <Select
-            key="preset"
-            options={[...PRESETS.map(p => ({ value: p.key, label: p.label })), ...(preset ? [] : [{ value: 'custom', label: 'Custom' }])]}
-            value={preset?.key ?? 'custom'}
-            onSelect={v => {
-              const p = PRESETS.find(x => x.key === v)
-              if (p) void presetSetup($, p.draft)
-            }}
-          />
-        )
-    const byKey = new Map(FIELDS.map(f => [f.key, f] as const))
 
+    if (step === REVIEW_STEP) {
+      return (
+        <Box flexDirection="column">
+          {heading('Review and save')}
+          {help(['Click a row to change it. Save writes your Claude Code settings, like /config, and the mod reloads with them.'])}
+          <Box key="rows" flexDirection="column" marginTop={gap}>
+            {FIELDS.map((f, i) => {
+              const changed = encode(draft[f.key] ?? '') !== encode(draftFromOptions(current)[f.key] ?? '')
+              return (
+                <Box key={`row:${f.key}`} flexDirection="row" columnGap={1}>
+                  <Button key={`edit:${f.key}`} plain label={`${f.label}: ${display(f, draft[f.key])}`} onPress={() => void gotoStep($, i + 1)} />
+                  {changed ? <Text color="yellow">changed</Text> : null}
+                </Box>
+              )
+            })}
+          </Box>
+          {nav}
+        </Box>
+      )
+    }
+
+    const f = FIELDS[step - 1] as Field
+    const value = draft[f.key]
+    const customOn = draft[`${f.key}:custom`] === true || (f.custom !== undefined && value !== undefined && !isListed(f, value))
+    const pick = (v: string | number | boolean) => {
+      void update($, draftAtom, d => ({ ...((d as SetupDraft | null) ?? draftFromOptions(current)), [f.key]: v, [`${f.key}:custom`]: false }))
+    }
     return (
       <Box flexDirection="column">
-        <Text key="title" bold color="cyan">cache-countdown setup</Text>
-        <Text key="detected" dimColor wrap="wrap">{`Detected: ${s.ttl} cache (${s.source})`}</Text>
-        <Box key="actions" flexDirection="row" columnGap={2} marginTop={gap}>
-          <Button key="save" label={count ? `Save ${count} change${count === 1 ? '' : 's'}` : 'Save'} variant="primary" onPress={() => void saveSetup($)} />
-          <Button key="reset" label="Recommended" onPress={() => void presetSetup($, PRESETS[0]!.draft)} />
-          <Button key="cancel" label="Cancel" role="dismiss" onPress={() => void $.ui.close({ id: SETUP })} />
+        {heading(f.title)}
+        {help(f.key === 'ttl' ? [...f.help, `Detected now: ${s.ttl} (${s.source}).`] : f.help)}
+        <Box key="choices" flexDirection="column" marginTop={gap}>
+          {f.choices.map(c => option(`${f.key}:${encode(c.value)}`, c.label, c.hint, !customOn && encode(c.value) === encode(value ?? ''), () => pick(c.value)))}
+          {f.custom ? option(`${f.key}:${CUSTOM}`, 'custom…', 'type your own below', customOn, () => void startCustom($, f.key)) : null}
+          {f.custom ? (
+            <Box key="custom-field" flexDirection="row" columnGap={1}>
+              <Text dimColor>custom:</Text>
+              <Input
+                key={`in:${f.key}`}
+                placeholder={f.custom.placeholder}
+                value={typeof draft[`${f.key}:text`] === 'string' ? (draft[`${f.key}:text`] as string) : value !== undefined && !isListed(f, value) ? encode(value) : ''}
+                submitLabel="use"
+                onInput={raw => {
+                  typing.set(f.key, raw)
+                }}
+                onSubmit={raw => void typeCustom($, f.key, raw)}
+              />
+            </Box>
+          ) : null}
         </Box>
-        <Box key="preset-block" flexDirection="column" marginTop={gap}>
-          {roomy ? <Text key="h:preset" bold color="cyan">PRESET</Text> : null}
-          {labelled('preset', 'Preset', presetControl)}
-          <Box key="about" flexDirection="row">
-            <Box width={LABEL_WIDTH} flexShrink={0} />
-            <Text dimColor wrap="wrap">{preset ? preset.about : 'your own picks'}</Text>
-          </Box>
-        </Box>
-        {SECTIONS.map(section => (
-          <Box key={`sec:${section.title}`} flexDirection="column" marginTop={gap}>
-            {roomy ? <Text key={`h:${section.title}`} bold color="cyan">{section.title}</Text> : null}
-            {section.keys.map(k => byKey.get(k)).filter((f): f is Field => !!f).map(fieldRow)}
-          </Box>
-        ))}
-        <Text key="hint" dimColor wrap="wrap">
-          {terminal ? 'Save writes your Claude Code settings, like /config · click or Tab+Enter to pick · Esc closes without saving' : 'Save writes your Claude Code settings, like /config.'}
-        </Text>
+        {nav}
       </Box>
     )
   })
