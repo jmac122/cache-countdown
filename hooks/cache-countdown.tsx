@@ -48,7 +48,8 @@ import {
   URGENT_SECS,
 } from './cache'
 import type { Advice, CacheEnv, Pace, Sample, TtlChoice, Ttl } from './cache'
-import { changes, choicesFor, decode, draftFromOptions, encode, FIELDS, PRESETS } from './setup'
+import { changes, choicesFor, decode, draftFromOptions, encode, FIELDS, LABEL_WIDTH, PRESETS, SECTIONS } from './setup'
+import type { Field } from './setup'
 import type { SetupChange, SetupDraft } from './setup'
 
 const PANE = 'cache'
@@ -415,24 +416,59 @@ export const register: Register = (on, options) => {
       )
     }
     const { Box, Text, Button, Select } = $.ui.resolve(e)
+    const terminal = e.surface === 'terminal'
+    // room for headings and spacing everywhere but the terminal's inline pane, whose height Claude Code caps
+    const roomy = !terminal || e.props.placement === 'dock'
+    const gap = roomy ? 1 : 0
+    // HTML collapses runs of spaces; a no-break space keeps chip padding on desktop
+    const sp = (t: string) => (terminal ? t : t.replace(/ /g, '\u00a0'))
     const preset = PRESETS.find(p => FIELDS.every(f => encode(p.draft[f.key] ?? '') === encode(draft[f.key] ?? '')))
     const count = changes(draft, current).length
 
-    return (
-      <Box flexDirection="column">
-        <Box key="head" flexDirection="row" columnGap={1} flexWrap="wrap">
-          <Text bold color="cyan">cache-countdown setup</Text>
-          <Text dimColor>{`· detected ${s.ttl} (${s.source})`}</Text>
+    // terminal: every choice is a chip you can click; the selected one sits on the accent colour
+    const chips = (key: string, items: { value: string; text: string }[], selected: string, pick: (value: string) => void) => (
+      <Box key={`chips:${key}`} flexDirection="row" columnGap={1} flexWrap="wrap">
+        {items.map(item => {
+          const isPicked = item.value === selected
+          return (
+            <Box key={`chip:${key}:${item.value}`} backgroundColor={isPicked ? 'cyan' : 'gray'}>
+              <Button key={`pick:${key}:${item.value}`} plain label={` ${item.text} `} onPress={() => pick(item.value)} />
+            </Box>
+          )
+        })}
+      </Box>
+    )
+    const labelled = (key: string, label: string, control: unknown) => (
+      <Box key={`row:${key}`} flexDirection="row">
+        <Box width={LABEL_WIDTH} flexShrink={0}>
+          <Text>{sp(label)}</Text>
         </Box>
-        <Box key="actions" flexDirection="row" columnGap={2}>
-          <Button key="save" label={count ? `Save ${count} change${count === 1 ? '' : 's'}` : 'Save'} variant="primary" onPress={() => void saveSetup($)} />
-          <Button key="reset" label="Recommended" onPress={() => void presetSetup($, PRESETS[0]!.draft)} />
-          <Button key="cancel" label="Cancel" role="dismiss" onPress={() => void $.ui.close({ id: SETUP })} />
-        </Box>
-        <Box key="preset">
+        {control as never}
+      </Box>
+    )
+    const fieldRow = (f: Field) => {
+      const choices = choicesFor(f, draft[f.key])
+      const selected = encode(draft[f.key] ?? '')
+      const control = terminal
+        ? chips(f.key, choices.map(c => ({ value: encode(c.value), text: c.short ?? c.label })), selected, v => void pickSetup($, f.key, decode(f, v)))
+        : (
+            <Select
+              key={f.key}
+              options={choices.map(c => ({ value: encode(c.value), label: c.label }))}
+              value={selected}
+              onSelect={v => void pickSetup($, f.key, decode(f, v))}
+            />
+          )
+      return labelled(f.key, f.label, control)
+    }
+    const presetControl = terminal
+      ? chips('preset', PRESETS.map(p => ({ value: p.key, text: p.label })), preset?.key ?? 'custom', v => {
+          const p = PRESETS.find(x => x.key === v)
+          if (p) void presetSetup($, p.draft)
+        })
+      : (
           <Select
             key="preset"
-            label="Preset"
             options={[...PRESETS.map(p => ({ value: p.key, label: p.label })), ...(preset ? [] : [{ value: 'custom', label: 'Custom' }])]}
             value={preset?.key ?? 'custom'}
             onSelect={v => {
@@ -440,20 +476,35 @@ export const register: Register = (on, options) => {
               if (p) void presetSetup($, p.draft)
             }}
           />
+        )
+    const byKey = new Map(FIELDS.map(f => [f.key, f] as const))
+
+    return (
+      <Box flexDirection="column">
+        <Text key="title" bold color="cyan">cache-countdown setup</Text>
+        <Text key="detected" dimColor wrap="wrap">{`Detected: ${s.ttl} cache (${s.source})`}</Text>
+        <Box key="actions" flexDirection="row" columnGap={2} marginTop={gap}>
+          <Button key="save" label={count ? `Save ${count} change${count === 1 ? '' : 's'}` : 'Save'} variant="primary" onPress={() => void saveSetup($)} />
+          <Button key="reset" label="Recommended" onPress={() => void presetSetup($, PRESETS[0]!.draft)} />
+          <Button key="cancel" label="Cancel" role="dismiss" onPress={() => void $.ui.close({ id: SETUP })} />
         </Box>
-        <Text key="about" dimColor wrap="wrap">{preset ? preset.about : 'your own picks'}</Text>
-        <Box key="fields" flexDirection="column">
-          {FIELDS.map(f => (
-            <Select
-              key={f.key}
-              label={f.label}
-              options={choicesFor(f, draft[f.key]).map(c => ({ value: encode(c.value), label: c.label }))}
-              value={encode(draft[f.key] ?? '')}
-              onSelect={v => void pickSetup($, f.key, decode(f, v))}
-            />
-          ))}
+        <Box key="preset-block" flexDirection="column" marginTop={gap}>
+          {roomy ? <Text key="h:preset" bold color="cyan">PRESET</Text> : null}
+          {labelled('preset', 'Preset', presetControl)}
+          <Box key="about" flexDirection="row">
+            <Box width={LABEL_WIDTH} flexShrink={0} />
+            <Text dimColor wrap="wrap">{preset ? preset.about : 'your own picks'}</Text>
+          </Box>
         </Box>
-        <Text dimColor wrap="wrap">Save writes your Claude Code settings, like /config · Tab moves · Esc closes without saving</Text>
+        {SECTIONS.map(section => (
+          <Box key={`sec:${section.title}`} flexDirection="column" marginTop={gap}>
+            {roomy ? <Text key={`h:${section.title}`} bold color="cyan">{section.title}</Text> : null}
+            {section.keys.map(k => byKey.get(k)).filter((f): f is Field => !!f).map(fieldRow)}
+          </Box>
+        ))}
+        <Text key="hint" dimColor wrap="wrap">
+          {terminal ? 'Save writes your Claude Code settings, like /config · click or Tab+Enter to pick · Esc closes without saving' : 'Save writes your Claude Code settings, like /config.'}
+        </Text>
       </Box>
     )
   })

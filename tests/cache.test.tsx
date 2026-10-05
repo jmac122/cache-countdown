@@ -396,8 +396,8 @@ describe('setup wizard', () => {
     expect((r as { text: string }).text).toContain('setup opened')
     const pane = await $.ui.mount({ plugin: 'cache-countdown', surface: 'terminal', component: 'Pane', requestId: 'cache-setup', props: { title: 'cache setup', isFocused: true, bodyColumns: 80, placement: 'dock' } as never })
     expect(await pane.find({ type: 'Text', text: /cache-countdown setup/ })).toBeDefined()
-    expect(await pane.find({ type: 'Select', key: 'tickSeconds' })).toBeDefined()
-    await pane.select({ key: 'preset', value: 'live' })
+    expect(await pane.find({ type: 'Button', key: 'pick:tickSeconds:60' })).toBeDefined()
+    await pane.press({ key: 'pick:preset:live' })
     expect(await pane.find({ type: 'Button', key: 'save', text: /Save 3 changes/ })).toBeDefined()
     await pane.press({ key: 'save' })
     await pane.unmount()
@@ -415,10 +415,30 @@ describe('setup wizard', () => {
     await start($)
     await $.command.run({ command: 'cache', args: 'setup' } as never)
     const pane = await $.ui.mount({ plugin: 'cache-countdown', surface: 'terminal', component: 'Pane', requestId: 'cache-setup', props: { title: 'cache setup', isFocused: true, bodyColumns: 80, placement: 'dock' } as never })
-    await pane.select({ key: 'status', value: 'true' })
+    await pane.press({ key: 'pick:status:true' })
     await pane.press({ key: 'save' })
     await pane.unmount()
     expect(w.toasts.at(-1)).toContain('status not saved (locked by managed settings)')
+  })
+})
+
+describe('setup wizard on desktop', () => {
+  test('desktop keeps native dropdowns, aligned, and saves the pick', async ($, on) => {
+    world(on)
+    const written: { key: string; value: unknown }[] = []
+    on('config.set', ($, e) => {
+      written.push({ key: e.key, value: e.value })
+      return { value: e.value } as never
+    })
+    await start($)
+    await $.command.run({ command: 'cache', args: 'setup' } as never)
+    const pane = await $.ui.mount({ plugin: 'cache-countdown', surface: 'desktop', component: 'Pane', requestId: 'cache-setup', props: { title: 'cache setup', isFocused: true, bodyColumns: 120, placement: 'dock' } as never })
+    expect(await pane.find({ type: 'Select', key: 'compactWhenRemainingPct' })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /COUNTDOWN/ })).toBeDefined()
+    await pane.select({ key: 'compactWhenRemainingPct', value: '40' })
+    await pane.press({ key: 'save' })
+    await pane.unmount()
+    expect(written).toEqual([{ key: 'cache-countdown.compactWhenRemainingPct', value: 40 }])
   })
 })
 

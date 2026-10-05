@@ -7,7 +7,7 @@ import type { SetupChange, SetupDraft } from '../types'
 export type { SetupChange, SetupDraft }
 
 type Value = string | number | boolean
-export type Choice = { value: Value; label: string }
+export type Choice = { value: Value; label: string; /** the terminal chip's text */ short?: string }
 export type Field = { key: string; label: string; choices: Choice[] }
 
 /**
@@ -19,87 +19,97 @@ export const FIELDS: Field[] = [
     key: 'ttl',
     label: 'Cache lifetime',
     choices: [
-      { value: 'auto', label: 'auto · default' },
-      { value: '1h', label: '1h (pinned)' },
-      { value: '5m', label: '5m (pinned)' },
+      { value: 'auto', label: 'auto · default', short: 'auto' },
+      { value: '1h', label: '1h (pinned)', short: '1h' },
+      { value: '5m', label: '5m (pinned)', short: '5m' },
     ],
   },
   {
     key: 'tickSeconds',
     label: 'Countdown step',
     choices: [
-      { value: 60, label: 'every minute, "59m" · default' },
-      { value: 10, label: 'every 10 s' },
-      { value: 1, label: 'every second, "59:42"' },
+      { value: 60, label: 'every minute, "59m" · default', short: 'every minute' },
+      { value: 10, label: 'every 10 s', short: '10 s' },
+      { value: 1, label: 'every second, "59:42"', short: 'every second' },
     ],
   },
   {
     key: 'warnSeconds',
     label: 'Final stretch',
     choices: [
-      { value: 30, label: 'last 30 s' },
-      { value: 60, label: 'last 60 s · default' },
-      { value: 120, label: 'last 2 min' },
-      { value: 300, label: 'last 5 min' },
+      { value: 30, label: 'last 30 s', short: '30 s' },
+      { value: 60, label: 'last 60 s · default', short: '60 s' },
+      { value: 120, label: 'last 2 min', short: '2 min' },
+      { value: 300, label: 'last 5 min', short: '5 min' },
     ],
   },
   {
     key: 'finalTickSeconds',
     label: 'Final stretch step',
     choices: [
-      { value: 1, label: 'every second · default' },
-      { value: 5, label: 'every 5 s' },
-      { value: 10, label: 'every 10 s' },
+      { value: 1, label: 'every second · default', short: '1 s' },
+      { value: 5, label: 'every 5 s', short: '5 s' },
+      { value: 10, label: 'every 10 s', short: '10 s' },
     ],
   },
   {
     key: 'toasts',
     label: 'Toasts at',
     choices: [
-      { value: '1m,10s,5s,1s', label: '1m, 10s, 5s, 1s · default' },
-      { value: '30m,15m,5m,1m', label: '30m, 15m, 5m, 1m' },
-      { value: '5m,2m,1m', label: '5m, 2m, 1m' },
-      { value: '1m', label: '1m only' },
-      { value: 'off', label: 'off' },
+      { value: '1m,10s,5s,1s', label: '1m, 10s, 5s, 1s · default', short: '1m 10s 5s 1s' },
+      { value: '30m,15m,5m,1m', label: '30m, 15m, 5m, 1m', short: '30m 15m 5m 1m' },
+      { value: '5m,2m,1m', label: '5m, 2m, 1m', short: '5m 2m 1m' },
+      { value: '1m', label: '1m only', short: '1m' },
+      { value: 'off', label: 'off', short: 'off' },
     ],
   },
   {
     key: 'toastWhenRemainingPct',
-    label: 'Toast when window remaining ≤',
+    label: 'Toast when remaining ≤',
     choices: [
-      { value: 100, label: 'always · default' },
-      { value: 90, label: '90% remaining' },
-      { value: 75, label: '75% remaining' },
-      { value: 50, label: '50% remaining' },
+      { value: 100, label: 'always · default', short: 'always' },
+      { value: 90, label: '90%', short: '90%' },
+      { value: 75, label: '75%', short: '75%' },
+      { value: 50, label: '50%', short: '50%' },
     ],
   },
   {
     key: 'compactWhenRemainingPct',
-    label: 'Suggest /compact when remaining ≤',
+    label: '/compact when remaining ≤',
     choices: [
-      { value: 75, label: '75% remaining' },
-      { value: 60, label: '60% remaining · default' },
-      { value: 40, label: '40% remaining' },
-      { value: 20, label: '20% remaining' },
+      { value: 75, label: '75%', short: '75%' },
+      { value: 60, label: '60% · default', short: '60%' },
+      { value: 40, label: '40%', short: '40%' },
+      { value: 20, label: '20%', short: '20%' },
     ],
   },
   {
     key: 'band',
     label: 'Meter above input box',
     choices: [
-      { value: true, label: 'on · default' },
-      { value: false, label: 'off' },
+      { value: true, label: 'on · default', short: 'on' },
+      { value: false, label: 'off', short: 'off' },
     ],
   },
   {
     key: 'status',
     label: 'Footer line',
     choices: [
-      { value: false, label: 'off · default' },
-      { value: true, label: 'on' },
+      { value: false, label: 'off · default', short: 'off' },
+      { value: true, label: 'on', short: 'on' },
     ],
   },
 ]
+
+/** How the wizard groups its rows when there is room for headings. */
+export const SECTIONS: { title: string; keys: string[] }[] = [
+  { title: 'COUNTDOWN', keys: ['ttl', 'tickSeconds', 'warnSeconds', 'finalTickSeconds'] },
+  { title: 'TOASTS', keys: ['toasts', 'toastWhenRemainingPct'] },
+  { title: 'ADVICE & DISPLAY', keys: ['compactWhenRemainingPct', 'band', 'status'] },
+]
+
+/** Width of the label column, so every picker starts in the same place. */
+export const LABEL_WIDTH = Math.max(...FIELDS.map(f => f.label.length), 'Preset'.length) + 2
 
 /** The manifest defaults, as the wizard's rows hold them. */
 export const DEFAULTS: SetupDraft = {
