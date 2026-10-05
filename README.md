@@ -14,14 +14,23 @@ A prompt-cache meter for Claude Code, written as a mod (function hooks).
 
 ## Install
 
-Requires Claude Code 2.1.287 or later (mods). Clone the repo, then start Claude Code with it:
+Requires Claude Code 2.1.287 or later (mods).
+
+**From the marketplace** (loads in every session):
+
+```
+/plugin marketplace add jmac122/cache-countdown
+/plugin install cache-countdown@cache-countdown
+```
+
+**For one session only**: clone it and point `--plugin-dir` at the folder:
 
 ```
 git clone https://github.com/jmac122/cache-countdown
 claude --plugin-dir ./cache-countdown
 ```
 
-Only sessions started with `--plugin-dir` load it. It writes nothing to `.claude/skills` and touches no settings until you press Save in `/cache setup`. On first load it shows one toast pointing at `/cache setup`, once ever.
+It writes nothing to your settings until you press Save in `/cache setup`. On first load it shows one toast pointing at `/cache setup`, once ever.
 
 ## How often it wakes
 
@@ -38,7 +47,7 @@ On a 1-hour cache with the defaults that's about 120 wakes per hour instead of 3
 
 ## Options
 
-Use `/cache setup`, the `/config` menu, or `pluginConfigs["cache-countdown"].options` in `~/.claude/settings.json` (use the key `cache-countdown@inline` for a `--plugin-dir` load):
+Use `/cache setup`, the `/config` menu, or `~/.claude/settings.json` under `pluginConfigs["cache-countdown@cache-countdown"].options` (marketplace install) or `pluginConfigs["cache-countdown"].options` (`--plugin-dir`):
 
 | Option | Default | |
 | --- | --- | --- |
