@@ -13,13 +13,16 @@
  *   - ui.render: AbovePrompt band + the /cache Pane
  *   - samples and the observed TTL live in $.state, so a hot reload keeps them
  *
- * Options: ttl auto|5m|1h, warnSeconds, tickSeconds, finalTickSeconds, compactAtTokens,
- *          band, status, toast, toastAt, toastMinTokens.
+ * Options: ttl auto|5m|1h, warnSeconds, tickSeconds, finalTickSeconds, compactWhenRemainingPct,
+ *          band, status, toast, toastAt, toastWhenRemainingPct.
  */
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 import {
   accountOf,
+  DEFAULT_WINDOW,
+  pctOption,
+  usedAt,
   advise,
   bar,
   byTurn,
@@ -78,8 +81,10 @@ type Config = {
   warnMs: number
   pace: Pace
   toastAt: number[]
-  toastMinTokens: number
-  compactAtTokens: number
+  /** toasts fire only once the window remaining is at or below this percentage (100 = always) */
+  toastWhenRemainingPct: number
+  /** an expired cache suggests /compact once the window remaining is at or below this percentage */
+  compactWhenRemainingPct: number
   showBand: boolean
   showStatus: boolean
   wantToast: boolean
@@ -92,8 +97,8 @@ let cfg: Config = {
   warnMs: 60_000,
   pace: { tickMs: 60_000, finalTickMs: 1_000, warnMs: 60_000 },
   toastAt: parseMarks(undefined),
-  toastMinTokens: 20_000,
-  compactAtTokens: 100_000, showBand: true, showStatus: false, wantToast: true, pinned: false, ttlOption: 'auto' }
+  toastWhenRemainingPct: 100,
+  compactWhenRemainingPct: 60, showBand: true, showStatus: false, wantToast: true, pinned: false, ttlOption: 'auto' }
 let env: CacheEnv = {}
 let setting: unknown
 let base: TtlChoice = decideTtl('auto', {})
@@ -103,6 +108,8 @@ let rerun = false
 let lastStatus: string | undefined
 let toastedFor = 0
 let toastLevel = Infinity
+// the session model's context window, from the status line's figures; 0 until reported
+let windowTokens = 0
 // the options this load runs with: what settings hold, defaults filled in
 let current: Readonly<Record<string, unknown>> = {}
 
@@ -121,7 +128,9 @@ async function snapshot($: EngineInterface, now: number): Promise<Snapshot> {
   const last = samples[samples.length - 1]
   const prev = samples[samples.length - 2]
   const disabled = isCachingDisabled(last?.model ?? '', env)
-  const advice = advise(last, prev, { ttl, warnMs: cfg.warnMs, compactAtTokens: cfg.compactAtTokens }, now, disabled)
+  const window = windowTokens || DEFAULT_WINDOW
+  const compactAtTokens = usedAt(window, cfg.compactWhenRemainingPct)
+  const advice = advise(last, prev, { ttl, warnMs: cfg.warnMs, compactAtTokens, windowTokens: windowTokens || undefined }, now, disabled)
   const left = last && !disabled ? remainingMs(last, ttl, now) : 0
   return { samples, last, ttl, source, advice, left }
 }
@@ -155,7 +164,7 @@ async function tick($: EngineInterface) {
         $.ui.status(line)
       }
     }
-    const toasting = cfg.wantToast && !!s.last && s.left > 0 && promptTokens(s.last) >= cfg.toastMinTokens
+    const toasting = cfg.wantToast && !!s.last && s.left > 0 && promptTokens(s.last) >= usedAt(windowTokens || DEFAULT_WINDOW, cfg.toastWhenRemainingPct)
     if (toasting && s.last) {
       if (toastedFor !== s.last.startedAt) {
         toastedFor = s.last.startedAt
@@ -240,15 +249,12 @@ async function presetSetup($: EngineInterface, draft: SetupDraft) {
   await update($, draftAtom, () => ({ ...draft }))
 }
 
-async function refreshBase($: EngineInterface) {
-  const first = decideTtl(cfg.ttlOption, env, setting)
-  if (!first.byAccount) {
-    base = first
-    return
-  }
-  // only the account default needs the rate-limit windows
+/** One status-line read: the model's context window, and the account when it decides the TTL. */
+async function refreshUsage($: EngineInterface) {
   const usage = await $.session.usage().catch(() => undefined)
-  base = decideTtl(cfg.ttlOption, env, setting, accountOf(usage?.rateLimits ?? []))
+  if (usage && usage.context.window > 0) windowTokens = usage.context.window
+  const first = decideTtl(cfg.ttlOption, env, setting)
+  base = first.byAccount ? decideTtl(cfg.ttlOption, env, setting, accountOf(usage?.rateLimits ?? [])) : first
 }
 
 export const register: Register = (on, options) => {
@@ -262,8 +268,8 @@ export const register: Register = (on, options) => {
       warnMs: warnMsOpt,
     },
     toastAt: parseMarks(options.toastAt),
-    toastMinTokens: typeof options.toastMinTokens === 'number' && options.toastMinTokens >= 0 ? options.toastMinTokens : 20_000,
-    compactAtTokens: positive(options.compactAtTokens, 100_000),
+    toastWhenRemainingPct: pctOption(options.toastWhenRemainingPct, 100),
+    compactWhenRemainingPct: pctOption(options.compactWhenRemainingPct, 60),
     showBand: options.band !== false,
     showStatus: options.status === true,
     wantToast: options.toast !== false,
@@ -290,7 +296,7 @@ export const register: Register = (on, options) => {
     env = { enable1h, force5m, ttlVar, disableAll, disableHaiku, disableSonnet, disableOpus }
     // merged over user, project, local, --settings and managed policy, as the engine runs
     setting = (await $.settings.read().catch(() => ({}) as Record<string, unknown>)).promptCacheTtl
-    await refreshBase($)
+    await refreshUsage($)
 
     await $.command
       .register({
@@ -356,15 +362,15 @@ export const register: Register = (on, options) => {
       const grown = [...all, sample]
       return grown.length > KEEP ? grown.slice(-KEEP) : grown
     })
+    // the window (model switches) and the account (a subscription running out of plan usage) can change mid-session
+    await refreshUsage($)
     if (!pinned) {
-      // a subscription that runs out of plan usage moves to usage credits mid-session
-      if (base.byAccount) await refreshBase($)
       const known = ((await read($, observedAtom)) as Ttl | null) ?? undefined
       const seen = observeTtl(prev, sample, known)
       if (seen !== known) await update($, observedAtom, () => seen ?? null)
     }
     $.ui.log(
-      `cache-countdown: step read=${sample.read} write=${sample.write} new=${sample.fresh} model=${sample.model} ttl=${base.ttl} (${base.source})`,
+      `cache-countdown: step read=${sample.read} write=${sample.write} new=${sample.fresh} model=${sample.model} ttl=${base.ttl} (${base.source}) window=${windowTokens}`,
       { to: 'debug' },
     )
     startTimer($)

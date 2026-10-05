@@ -26,7 +26,19 @@ export type CacheEnv = {
 
 export type AdviceKind = 'off' | 'cold' | 'uncached' | 'warm' | 'soon' | 'expired' | 'miss'
 export type Advice = { kind: AdviceKind; text: string }
-export type Policy = { ttl: Ttl; warnMs: number; compactAtTokens: number }
+export type Policy = { ttl: Ttl; warnMs: number; compactAtTokens: number; /** the model's context window, when known: the advice then says how much is left */ windowTokens?: number }
+
+/** Used when the session has not reported its window yet. */
+export const DEFAULT_WINDOW = 200_000
+
+/** Tokens of context at which only `remainingPct` of the window is left. 100 → 0 (always). */
+export const usedAt = (windowTokens: number, remainingPct: number) => Math.round(windowTokens * (1 - Math.min(100, Math.max(0, remainingPct)) / 100))
+
+/** Share of the window left after `tokens`, as a whole percentage. */
+export const remainingPct = (tokens: number, windowTokens: number) => Math.max(0, Math.min(100, Math.round(100 - (tokens / windowTokens) * 100)))
+
+/** A remaining-percentage option: 1–100, else the fallback. */
+export const pctOption = (v: unknown, fallback: number) => (typeof v === 'number' && Number.isFinite(v) && v > 0 && v <= 100 ? v : fallback)
 export type Account = 'subscription' | 'credits' | 'other'
 export type TtlChoice = { ttl: Ttl; source: string; /** the answer depends on the account, so re-check it after requests */ byAccount: boolean }
 
@@ -103,9 +115,10 @@ export function advise(last: Sample | undefined, prev: Sample | undefined, polic
   const left = remainingMs(last, policy.ttl, now)
   const size = promptTokens(last)
   if (left <= 0) {
+    const left = policy.windowTokens ? ` (${remainingPct(size, policy.windowTokens)}% of window remaining)` : ''
     return size >= policy.compactAtTokens
-      ? { kind: 'expired', text: `expired: next message rewrites ${fmtTokens(size)} tokens. /compact first, or /clear if done` }
-      : { kind: 'expired', text: `expired: only ${fmtTokens(size)} tokens to rebuild, keep going` }
+      ? { kind: 'expired', text: `expired: next message rewrites ${fmtTokens(size)} tokens${left}. /compact first, or /clear if done` }
+      : { kind: 'expired', text: `expired: ${fmtTokens(size)} tokens to rebuild${left}, keep going` }
   }
   if (left <= policy.warnMs) return { kind: 'soon', text: 'expires soon: any message refreshes it for free' }
   const miss = missReason(prev, last, policy.ttl)

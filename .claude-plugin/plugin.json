@@ -1,6 +1,6 @@
 {
   "name": "cache-countdown",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Prompt-cache meter above the prompt: hit %, read/wrote/new tokens, a TTL countdown and advice (warm, soon, expired, miss, off). /cache opens a pane with a countdown bar, the last request's stacked bar and a per-turn table; /cache setup is a settings wizard. Configurable tick rate: once a minute by default, every second in the final minute.",
   "types": "./types/index.d.ts",
   "author": {
@@ -45,11 +45,11 @@
       "description": "How often the countdown updates inside the last warnSeconds",
       "default": 1
     },
-    "compactAtTokens": {
+    "compactWhenRemainingPct": {
       "type": "number",
-      "title": "Large context (tokens)",
-      "description": "From this prompt size up, an expired cache suggests /compact (or /clear)",
-      "default": 100000
+      "title": "Suggest /compact when window remaining ≤ (%)",
+      "description": "Once the context window remaining is at or below this percentage, an expired cache suggests /compact (or /clear) instead of \"keep going\". Adapts to the model: 60 means 400k used on a 1M window, 80k on 200k",
+      "default": 60
     },
     "band": {
       "type": "boolean",
@@ -75,11 +75,11 @@
       "description": "Comma-separated times left at which a toast fires, with units: 30m,15m,5m,1m or 1m,10s,5s,1s (h, m, s; a bare number is seconds). Keep marks at least 3 s apart: Claude Code drops a toast within 2 s of the previous one",
       "default": "1m,10s,5s,1s"
     },
-    "toastMinTokens": {
+    "toastWhenRemainingPct": {
       "type": "number",
-      "title": "Toast only from (tokens)",
-      "description": "Prompts smaller than this never toast: a lapsed small cache is cheap to rebuild. 0 toasts always",
-      "default": 20000
+      "title": "Toast when window remaining ≤ (%)",
+      "description": "Expiry toasts fire only once the context window remaining is at or below this percentage. 100 = always; 75 = only after a quarter of the window is used",
+      "default": 100
     }
   },
   "homepage": "https://github.com/jmac122/cache-countdown",

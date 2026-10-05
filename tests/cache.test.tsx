@@ -145,7 +145,7 @@ type World = { toasts: string[]; status: (string | undefined)[]; logs: string[];
 
 function world(
   on: On,
-  opts: { env?: Record<string, string>; cache?: { read: number; write: number }; limits?: { kind: string; percentUsed: number }[]; settings?: Record<string, unknown> } = {},
+  opts: { env?: Record<string, string>; cache?: { read: number; write: number }; limits?: { kind: string; percentUsed: number }[]; settings?: Record<string, unknown>; window?: number } = {},
 ): World {
   const w = { toasts: [] as string[], status: [] as (string | undefined)[], logs: [] as string[], ticks: 0 } as World
   const cache = opts.cache ?? { read: 80_000, write: 1_000 }
@@ -157,7 +157,7 @@ function world(
   w.clock = mock.clock(on, { now: T0 })
   mock.env(on, opts.env ?? {})
   mock.store(on, { setupSeen: true })
-  on('session.usage', () => ({ value: { startedAt: 0, context: {}, rateLimits: opts.limits ?? [] } }) as never)
+  on('session.usage', () => ({ value: { startedAt: 0, context: opts.window ? { window: opts.window } : {}, rateLimits: opts.limits ?? [] } }) as never)
   on('settings.read', () => ({ value: opts.settings ?? {} }) as never)
   on('session.start', async ($, e) => ({ cwd: e.cwd }) as never)
   on('session.end', async () => ({ sessionId: 's1' }) as never)
@@ -257,13 +257,6 @@ describe('band', () => {
     expect(w.ticks).toBe(before)
   })
 
-  test('small prompts (< 20k) never toast', async ($, on) => {
-    const w = world(on, { cache: { read: 5_000, write: 200 } })
-    await start($)
-    await step($)
-    await w.clock.advance(310_000)
-    expect(w.toasts).toEqual([])
-  })
 
   test('DISABLE_PROMPT_CACHING says off and runs no countdown', async ($, on) => {
     const w = world(on, { env: { DISABLE_PROMPT_CACHING: '1' } })
@@ -325,12 +318,41 @@ describe('pace and toasts are configurable', () => {
     expect(w.toasts[1]).toContain('5s')
   })
 
-  test('toastMinTokens 0 toasts small prompts too', { options: { toastMinTokens: 0, toastAt: '10' } }, async ($, on) => {
-    const w = world(on, { cache: { read: 5_000, write: 200 } })
+  test('toastWhenRemainingPct gates toasts by window remaining', { options: { toastWhenRemainingPct: 75, toastAt: '10s' } }, async ($, on) => {
+    // 81.3k of a 1M window: 92% remaining, above 75%, so no toast
+    const big = world(on, { window: 1_000_000 })
+    await start($)
+    await step($)
+    await big.clock.advance(301_000)
+    expect(big.toasts).toEqual([])
+  })
+
+  test('the same prompt on a 100k window (19% remaining) toasts', { options: { toastWhenRemainingPct: 75, toastAt: '10s' } }, async ($, on) => {
+    const small = world(on, { window: 100_000 })
+    await start($)
+    await step($)
+    await small.clock.advance(301_000)
+    expect(small.toasts.length).toBe(1)
+  })
+
+  test('/compact advice follows window remaining, and says how much is left', async ($, on) => {
+    const w = world(on, { window: 1_000_000 })
     await start($)
     await step($)
     await w.clock.advance(301_000)
-    expect(w.toasts.length).toBe(1)
+    const ui = await band($)
+    expect(await ui.find({ type: 'Text', text: /92% of window remaining\), keep going/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('on a 120k window the same context (32% remaining) suggests /compact', async ($, on) => {
+    const w = world(on, { window: 120_000 })
+    await start($)
+    await step($)
+    await w.clock.advance(301_000)
+    const ui = await band($)
+    expect(await ui.find({ type: 'Text', text: /32% of window remaining\)\. \/compact first/ })).toBeDefined()
+    await ui.unmount()
   })
 })
 
@@ -351,7 +373,7 @@ describe('toasts in minutes', () => {
 
 describe('setup wizard', () => {
   test('pure: draft from options, toast row, changes', () => {
-    const d = draftFromOptions({ ttl: 'auto', tickSeconds: 60, warnSeconds: 60, finalTickSeconds: 1, toast: true, toastAt: '1m,10s,5s,1s', toastMinTokens: 20_000, compactAtTokens: 100_000, band: true, status: false })
+    const d = draftFromOptions({ ttl: 'auto', tickSeconds: 60, warnSeconds: 60, finalTickSeconds: 1, toast: true, toastAt: '1m,10s,5s,1s', toastWhenRemainingPct: 100, compactWhenRemainingPct: 60, band: true, status: false })
     expect(d).toEqual(PRESETS[0]!.draft)
     expect(toastsRow(false, '60')).toBe('off')
     expect(splitToasts('off')).toEqual({ toast: false })

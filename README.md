@@ -57,8 +57,8 @@ Use `/cache setup`, the `/config` menu, or `~/.claude/settings.json` under `plug
 | `finalTickSeconds` | 1 | countdown step inside the final stretch |
 | `toast` | true | expiry toasts on/off |
 | `toastAt` | `1m,10s,5s,1s` | times left at which a toast fires, once each per cache entry, with units: `30m, 15m, 5m, 1m`, `5m, 2m, 1m`, `90s`, `1h` (a bare number is seconds). Keep marks at least 3 s apart: Claude Code drops a toast that comes within 2 s of the previous one |
-| `toastMinTokens` | 20000 | smaller prompts never toast (0 = always) |
-| `compactAtTokens` | 100000 | above this, an expired cache suggests `/compact` |
+| `toastWhenRemainingPct` | 100 | expiry toasts fire only once the context window remaining is at or below this % (100 = always) |
+| `compactWhenRemainingPct` | 60 | once the window remaining is at or below this %, an expired cache suggests `/compact` instead of "keep going" (60 = 400k used on a 1M window, 80k on 200k) |
 | `band` | true | the meter row above the input box |
 | `status` | false | a short footer line beside your statusline |
 
