@@ -1,0 +1,4 @@
+{
+  "description": "cache-countdown: turn.step reads main-loop cache usage; one self-scheduling clock.after timer wakes only when the countdown text changes or a toast is due; ui.render draws the band, the /cache pane and the /cache setup wizard",
+  "modules": ["./cache-countdown.tsx"]
+}

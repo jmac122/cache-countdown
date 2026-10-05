@@ -1,0 +1,187 @@
+/**
+ * setup.ts: the /cache setup wizard's pure half. Fields, choices, presets and
+ * the diff between the picks and what settings hold. No `$`.
+ */
+import type { SetupChange, SetupDraft } from '../types'
+
+export type { SetupChange, SetupDraft }
+
+type Value = string | number | boolean
+export type Choice = { value: Value; label: string }
+export type Field = { key: string; label: string; choices: Choice[] }
+
+/**
+ * The wizard's rows. `toast` and `toastAt` share one row ("toasts") so a
+ * newcomer picks one thing; `toastsRow` / `splitToasts` map between them.
+ */
+export const FIELDS: Field[] = [
+  {
+    key: 'ttl',
+    label: 'Cache lifetime',
+    choices: [
+      { value: 'auto', label: 'auto: follow Claude Code (recommended)' },
+      { value: '1h', label: '1h: pin one hour' },
+      { value: '5m', label: '5m: pin five minutes' },
+    ],
+  },
+  {
+    key: 'tickSeconds',
+    label: 'Countdown step',
+    choices: [
+      { value: 60, label: 'every minute, "59m" (recommended)' },
+      { value: 10, label: 'every 10 seconds' },
+      { value: 1, label: 'every second, "59:42"' },
+    ],
+  },
+  {
+    key: 'warnSeconds',
+    label: 'Final stretch',
+    choices: [
+      { value: 30, label: 'last 30 seconds' },
+      { value: 60, label: 'last 60 seconds (recommended)' },
+      { value: 120, label: 'last 2 minutes' },
+      { value: 300, label: 'last 5 minutes' },
+    ],
+  },
+  {
+    key: 'finalTickSeconds',
+    label: 'Final stretch step',
+    choices: [
+      { value: 1, label: 'every second (recommended)' },
+      { value: 5, label: 'every 5 seconds' },
+      { value: 10, label: 'every 10 seconds' },
+    ],
+  },
+  {
+    key: 'toasts',
+    label: 'Expiry toasts',
+    choices: [
+      { value: '60,10,5,1', label: 'at 60, 10, 5 and 1 s left (recommended)' },
+      { value: '300,60,10', label: 'at 5 min, 60 s and 10 s left' },
+      { value: '60', label: 'once, at 60 s left' },
+      { value: 'off', label: 'off' },
+    ],
+  },
+  {
+    key: 'toastMinTokens',
+    label: 'Toast only from',
+    choices: [
+      { value: 0, label: 'any prompt size' },
+      { value: 20_000, label: '20k tokens (recommended)' },
+      { value: 50_000, label: '50k tokens' },
+      { value: 100_000, label: '100k tokens' },
+    ],
+  },
+  {
+    key: 'compactAtTokens',
+    label: 'Suggest /compact from',
+    choices: [
+      { value: 50_000, label: '50k tokens' },
+      { value: 100_000, label: '100k tokens (recommended)' },
+      { value: 200_000, label: '200k tokens' },
+    ],
+  },
+  {
+    key: 'band',
+    label: 'Band above the prompt',
+    choices: [
+      { value: true, label: 'on (recommended)' },
+      { value: false, label: 'off' },
+    ],
+  },
+  {
+    key: 'status',
+    label: 'Status line entry',
+    choices: [
+      { value: false, label: 'off (recommended)' },
+      { value: true, label: 'on' },
+    ],
+  },
+]
+
+/** The manifest defaults, as the wizard's rows hold them. */
+export const DEFAULTS: SetupDraft = {
+  ttl: 'auto',
+  tickSeconds: 60,
+  warnSeconds: 60,
+  finalTickSeconds: 1,
+  toasts: '60,10,5,1',
+  toastMinTokens: 20_000,
+  compactAtTokens: 100_000,
+  band: true,
+  status: false,
+}
+
+export type PresetKey = 'recommended' | 'quiet' | 'live'
+
+export const PRESETS: { key: PresetKey; label: string; draft: SetupDraft }[] = [
+  { key: 'recommended', label: 'Recommended: minute steps, seconds in the last minute, 4 toasts', draft: DEFAULTS },
+  {
+    key: 'quiet',
+    label: 'Quiet: band only, minute steps, no toasts',
+    draft: { ...DEFAULTS, finalTickSeconds: 10, toasts: 'off' },
+  },
+  {
+    key: 'live',
+    label: 'Live: per-second countdown, status entry, early toasts',
+    draft: { ...DEFAULTS, tickSeconds: 1, toasts: '300,60,10', status: true },
+  },
+]
+
+/** The value a Select carries: Select options are strings. */
+export const encode = (v: Value) => String(v)
+
+/** A Select's string back to the field's type, from that field's choices. */
+export function decode(field: Field, raw: string): Value {
+  const hit = field.choices.find(c => encode(c.value) === raw)
+  if (hit) return hit.value
+  if (typeof field.choices[0]?.value === 'number') return Number(raw)
+  if (typeof field.choices[0]?.value === 'boolean') return raw === 'true'
+  return raw
+}
+
+/** A field's choices, with the current value added as "current: …" when settings hold one the list lacks. */
+export function choicesFor(field: Field, current: Value | undefined): Choice[] {
+  if (current === undefined || field.choices.some(c => encode(c.value) === encode(current))) return field.choices
+  return [...field.choices, { value: current, label: `current: ${encode(current)}` }]
+}
+
+/** Merge the toast pair into the wizard's one "toasts" row. */
+export function toastsRow(toast: unknown, toastAt: unknown): string {
+  if (toast === false) return 'off'
+  return typeof toastAt === 'string' && toastAt.trim() ? toastAt.replace(/\s+/g, '') : '60,10,5,1'
+}
+
+/** The wizard's "toasts" row back into the two settings it stands for. */
+export function splitToasts(row: Value): { toast: boolean; toastAt?: string } {
+  return row === 'off' ? { toast: false } : { toast: true, toastAt: String(row) }
+}
+
+/** The draft the wizard opens with: what settings hold now, as its rows. */
+export function draftFromOptions(values: Readonly<Record<string, unknown>>): SetupDraft {
+  const draft: SetupDraft = { ...DEFAULTS }
+  for (const f of FIELDS) {
+    if (f.key === 'toasts') continue
+    const v = values[f.key]
+    if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') draft[f.key] = v
+  }
+  draft.toasts = toastsRow(values.toast, values.toastAt)
+  return draft
+}
+
+/** The settings to write: each userConfig field whose value the draft changes. */
+export function changes(draft: SetupDraft, values: Readonly<Record<string, unknown>>): SetupChange[] {
+  const out: SetupChange[] = []
+  for (const f of FIELDS) {
+    const v = draft[f.key]
+    if (v === undefined) continue
+    if (f.key === 'toasts') {
+      const { toast, toastAt } = splitToasts(v)
+      if (values.toast !== toast) out.push({ key: 'toast', value: toast })
+      if (toastAt !== undefined && values.toastAt !== toastAt) out.push({ key: 'toastAt', value: toastAt })
+      continue
+    }
+    if (values[f.key] !== v) out.push({ key: f.key, value: v })
+  }
+  return out
+}
