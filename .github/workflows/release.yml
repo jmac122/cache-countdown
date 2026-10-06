@@ -7,6 +7,9 @@ name: check and release
 # and publishes a GitHub Release, marked Latest, with notes listing every commit since the previous
 # v* tag. Bumping the version is the release trigger: Claude Code only updates an install when the
 # version changes, so a push without a bump ships nothing and gets no release.
+#
+# Values move between steps through files and step outputs, not command substitution, so every
+# command here is written out in full.
 
 on:
   push:
@@ -31,13 +34,11 @@ jobs:
       - name: Install Claude Code
         run: npm install -g @anthropic-ai/claude-code
       - name: Versions agree
-        run: |
-          v=$(jq -r .version .claude-plugin/plugin.json)
-          m=$(jq -r '.plugins[] | select(.name == "cache-countdown") | .version' .claude-plugin/marketplace.json)
-          if [ "$v" != "$m" ]; then
-            echo "::error::plugin.json is $v but marketplace.json is $m"
-            exit 1
-          fi
+        run: >-
+          jq -e -n
+          --slurpfile p .claude-plugin/plugin.json
+          --slurpfile m .claude-plugin/marketplace.json
+          '$p[0].version == ($m[0].plugins[] | select(.name == "cache-countdown") | .version)'
       - name: Validate
         run: claude plugin validate --strict .
       - name: Test
@@ -57,24 +58,34 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
           persist-credentials: false
-      - name: Tag and release
+      - name: Read the version
+        id: version
+        run: jq -r '"tag=v" + .version' .claude-plugin/plugin.json >> "$GITHUB_OUTPUT"
+      - name: Is it new?
+        id: new
         env:
-          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/$TAG" > /dev/null; then
+            echo "$TAG is already tagged; no new version in this push"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Write the notes
+        if: steps.new.outputs.release == 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
           REPO: ${{ github.repository }}
         run: |
-          tag="v$(jq -r .version .claude-plugin/plugin.json)"
-          if git rev-parse -q --verify "refs/tags/$tag" > /dev/null; then
-            echo "$tag is already tagged; no new version in this push"
-            exit 0
-          fi
-          prev=$(git tag --list 'v*' --merged HEAD --sort=-v:refname | head -n 1)
+          git tag --list 'v*' --merged HEAD --sort=-v:refname | head -n 1 > prev.txt
+          read -r prev < prev.txt || prev=""
           {
             if [ -n "$prev" ]; then
               echo "## Changes since $prev"
               echo
               git log --no-merges --pretty='- %s' "$prev..HEAD"
               echo
-              echo "**Full changelog**: https://github.com/$REPO/compare/$prev...$tag"
+              echo "**Full changelog**: https://github.com/$REPO/compare/$prev...$TAG"
             else
               echo "## Changes"
               echo
@@ -89,12 +100,10 @@ jobs:
             echo '```'
           } > notes.md
           cat notes.md
-          # A re-run can find the release already made: that counts as success.
-          if out=$(gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --notes-file notes.md --latest 2>&1); then
-            echo "$out"
-          elif gh release view "$tag" > /dev/null 2>&1; then
-            echo "$tag was released by another run; left as is"
-          else
-            echo "$out"
-            exit 1
-          fi
+      - name: Publish the release
+        if: steps.new.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        # a re-run that finds the release already made counts as success
+        run: gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --notes-file notes.md --latest || gh release view "$TAG" > /dev/null
