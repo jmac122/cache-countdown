@@ -1,0 +1,100 @@
+name: check and release
+
+# Every push and PR: the versions in plugin.json and marketplace.json agree, the plugin validates
+# (--strict), and its tests pass.
+#
+# A push to main whose .claude-plugin/plugin.json version has no vX.Y.Z tag yet also tags that commit
+# and publishes a GitHub Release, marked Latest, with notes listing every commit since the previous
+# v* tag. Bumping the version is the release trigger: Claude Code only updates an install when the
+# version changes, so a push without a bump ships nothing and gets no release.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: validate and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: '22'
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+      - name: Versions agree
+        run: |
+          v=$(jq -r .version .claude-plugin/plugin.json)
+          m=$(jq -r '.plugins[] | select(.name == "cache-countdown") | .version' .claude-plugin/marketplace.json)
+          if [ "$v" != "$m" ]; then
+            echo "::error::plugin.json is $v but marketplace.json is $m"
+            exit 1
+          fi
+      - name: Validate
+        run: claude plugin validate --strict .
+      - name: Test
+        run: claude plugin test .
+
+  release:
+    name: release a new version
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # the tag and the GitHub Release, both through GH_TOKEN
+    steps:
+      # fetch-depth: 0 + fetch-tags: the notes are the commits since the previous v* tag.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          tag="v$(jq -r .version .claude-plugin/plugin.json)"
+          if git rev-parse -q --verify "refs/tags/$tag" > /dev/null; then
+            echo "$tag is already tagged; no new version in this push"
+            exit 0
+          fi
+          prev=$(git tag --list 'v*' --merged HEAD --sort=-v:refname | head -n 1)
+          {
+            if [ -n "$prev" ]; then
+              echo "## Changes since $prev"
+              echo
+              git log --no-merges --pretty='- %s' "$prev..HEAD"
+              echo
+              echo "**Full changelog**: https://github.com/$REPO/compare/$prev...$tag"
+            else
+              echo "## Changes"
+              echo
+              git log --no-merges --pretty='- %s'
+            fi
+            echo
+            echo "## Install"
+            echo
+            echo '```'
+            echo '/plugin marketplace add jmac122/cache-countdown'
+            echo '/plugin install cache-countdown@cache-countdown'
+            echo '```'
+          } > notes.md
+          cat notes.md
+          # A re-run can find the release already made: that counts as success.
+          if out=$(gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --notes-file notes.md --latest 2>&1); then
+            echo "$out"
+          elif gh release view "$tag" > /dev/null 2>&1; then
+            echo "$tag was released by another run; left as is"
+          else
+            echo "$out"
+            exit 1
+          fi
