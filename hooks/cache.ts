@@ -1,326 +1,448 @@
 /**
- * cache.ts: the pure half of cache-countdown. No `$`, no engine, no timers.
- *
- * Model (Anthropic prompt-caching docs):
- *   - entries live 5 minutes by default, 1 hour when asked for; a read refreshes
- *     the entry for free; the lifetime counts from the START of the request
- *   - prompt = input_tokens (uncached) + cache_read + cache_creation
- *   - a prefix change (model, effort, tools, system prompt) writes instead of reads
- *
- * Logic ported from davila7/claude-code-templates mods/observability/prompt-cache-control (MIT).
+ * cache.ts: cache-countdown's pure half. Parsing the options, choosing the
+ * cache lifetime, reading request timing, the advice, the countdown text and
+ * when the timer next has to wake, the per-request view, and the number
+ * formats. No `$`, no engine, no timers: everything here is a function of its
+ * arguments, so the tests call it directly.
  */
-import type { Sample, Ttl } from '../types'
+import type { CacheLast, CacheObserved, CacheSample, CacheTurnRow, CacheView } from '../types'
 
-export type { Sample, Ttl }
+// ---------------------------------------------------------------- options
 
-export type CacheEnv = {
-  enable1h?: string
-  force5m?: string
-  /** CLAUDE_CODE_PROMPT_CACHE_TTL */
-  ttlVar?: string
-  disableAll?: string
-  disableHaiku?: string
-  disableSonnet?: string
-  disableOpus?: string
+export const DEFAULT_MARKS = [60, 10, 5, 1]
+export const DEFAULT_LEVELS = [50, 25, 10]
+
+export type Config = {
+  /** 'auto', '5m' or '1h' */
+  ttl: string
+  warnSeconds: number
+  tickSeconds: number
+  finalTickSeconds: number
+  compactWhenRemainingPct: number
+  band: boolean
+  status: boolean
+  toast: boolean
+  /** seconds left at which a toast fires, descending */
+  marks: number[]
+  /** % of the context window remaining at which an alert fires, descending */
+  levels: number[]
 }
 
-export type AdviceKind = 'off' | 'cold' | 'uncached' | 'warm' | 'soon' | 'expired' | 'miss'
-export type Advice = { kind: AdviceKind; text: string }
-export type Policy = { ttl: Ttl; warnMs: number; compactAtTokens: number; /** the model's context window, when known: the advice then says how much is left */ windowTokens?: number }
+const positive = (v: unknown, fallback: number): number => {
+  const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN
+  return Number.isFinite(n) && n > 0 ? n : fallback
+}
 
-/** Used when the session has not reported its window yet. */
-export const DEFAULT_WINDOW = 200_000
+const flag = (v: unknown, fallback: boolean): boolean => {
+  if (typeof v === 'boolean') return v
+  if (typeof v === 'string') {
+    const s = v.trim().toLowerCase()
+    if (s === 'true') return true
+    if (s === 'false') return false
+  }
+  return fallback
+}
 
-/** Tokens of context at which only `remainingPct` of the window is left. 100 → 0 (always). */
-export const usedAt = (windowTokens: number, remainingPct: number) => Math.round(windowTokens * (1 - Math.min(100, Math.max(0, remainingPct)) / 100))
+const listText = (v: unknown): string | undefined => {
+  if (typeof v === 'string') return v
+  if (typeof v === 'number') return String(v)
+  if (Array.isArray(v)) return v.map(String).join(',')
+  return undefined
+}
 
-/** Share of the window left after `tokens`, as a whole percentage. */
-export const remainingPct = (tokens: number, windowTokens: number) => Math.max(0, Math.min(100, Math.round(100 - (tokens / windowTokens) * 100)))
+/** The options as `register` receives them, checked and filled in. */
+export function readConfig(o: Readonly<Record<string, unknown>>): Config {
+  const ttl = typeof o.ttl === 'string' ? o.ttl.trim().toLowerCase() : ''
+  return {
+    ttl: ttl === '5m' || ttl === '1h' ? ttl : 'auto',
+    warnSeconds: positive(o.warnSeconds, 60),
+    tickSeconds: positive(o.tickSeconds, 60),
+    finalTickSeconds: positive(o.finalTickSeconds, 1),
+    compactWhenRemainingPct: Math.min(100, positive(o.compactWhenRemainingPct, 60)),
+    band: flag(o.band, true),
+    status: flag(o.status, false),
+    toast: flag(o.toast, true),
+    marks: parseMarks(o.toastAt),
+    levels: parsePercents(o.contextAlertsAt),
+  }
+}
 
-/** A remaining-percentage option: 1–100, else the fallback. */
-export const pctOption = (v: unknown, fallback: number) => (typeof v === 'number' && Number.isFinite(v) && v > 0 && v <= 100 ? v : fallback)
+const SPAN = /^(\d+(?:\.\d+)?|\.\d+)\s*(h|hr|hrs|hours?|m|min|mins|minutes?|s|sec|secs|seconds?)?$/
+
+/** One span ("1h", "1.5 min", "90s", or a bare number of seconds) in seconds; undefined when it is not one. */
+export function parseSpan(v: unknown): number | undefined {
+  const text = typeof v === 'number' ? String(v) : typeof v === 'string' ? v.trim().toLowerCase() : ''
+  const m = SPAN.exec(text)
+  if (!m) return undefined
+  const n = Number(m[1])
+  const unit = m[2] ?? 's'
+  const seconds = unit.startsWith('h') ? n * 3600 : unit.startsWith('m') ? n * 60 : n
+  if (!Number.isFinite(seconds) || seconds <= 0) return undefined
+  return Math.round(seconds * 1000) / 1000
+}
+
+/** The toast marks: a comma list of spans, deduplicated, longest first; nothing valid gives the default. */
+export function parseMarks(v: unknown): number[] {
+  const text = listText(v) ?? ''
+  const marks = [...new Set(text.split(/[,;]+/).map(parseSpan).filter((s): s is number => s !== undefined))]
+  return marks.length ? marks.sort((a, b) => b - a) : [...DEFAULT_MARKS]
+}
+
+/** A comma list of whole percents 1..99, deduplicated, highest first; off/none/empty is none; nothing valid gives `fallback`. */
+export function parsePercents(v: unknown, fallback: number[] = DEFAULT_LEVELS): number[] {
+  const text = listText(v)
+  if (text === undefined) return [...fallback]
+  const t = text.trim().toLowerCase()
+  if (t === '' || t === 'off' || t === 'none') return []
+  const found = new Set<number>()
+  for (const part of t.split(/[,;\s]+/)) {
+    const m = /^(\d+)%?$/.exec(part)
+    if (!m) continue
+    const n = Number(m[1])
+    if (n >= 1 && n <= 99) found.add(n)
+  }
+  return found.size ? [...found].sort((a, b) => b - a) : [...fallback]
+}
+
+// ---------------------------------------------------------------- lifetime
+
 export type Account = 'subscription' | 'credits' | 'other'
-export type TtlChoice = { ttl: Ttl; source: string; /** the answer depends on the account, so re-check it after requests */ byAccount: boolean }
 
-export const isOn = (v: string | undefined) => v === '1' || v?.toLowerCase() === 'true'
-const asTtl = (v: unknown): Ttl | undefined => (v === '5m' || v === '1h' ? v : undefined)
-
-/**
- * The TTL Claude Code asks for on the main conversation, first match wins:
- * the mod's ttl option, FORCE_PROMPT_CACHING_5M, CLAUDE_CODE_PROMPT_CACHE_TTL,
- * the promptCacheTtl setting, ENABLE_PROMPT_CACHING_1H, then the account
- * (1h on a Claude subscription within plan usage, 5m otherwise).
- */
-export function decideTtl(option: unknown, env: CacheEnv, setting?: unknown, account?: Account): TtlChoice {
-  const pinned = asTtl(option)
-  if (pinned) return { ttl: pinned, source: 'ttl option', byAccount: false }
-  if (isOn(env.force5m)) return { ttl: '5m', source: 'FORCE_PROMPT_CACHING_5M', byAccount: false }
-  const fromVar = asTtl(env.ttlVar)
-  if (fromVar) return { ttl: fromVar, source: 'CLAUDE_CODE_PROMPT_CACHE_TTL', byAccount: false }
-  const fromSetting = asTtl(setting)
-  if (fromSetting) return { ttl: fromSetting, source: 'promptCacheTtl setting', byAccount: false }
-  if (isOn(env.enable1h)) return { ttl: '1h', source: 'ENABLE_PROMPT_CACHING_1H', byAccount: false }
-  if (account === 'subscription') return { ttl: '1h', source: 'Claude subscription default', byAccount: true }
-  if (account === 'credits') return { ttl: '5m', source: 'usage credits default', byAccount: true }
-  return { ttl: '5m', source: 'default', byAccount: true }
-}
-
-/** From the rate-limit windows: a plan window means a subscription; a full one means usage credits. */
-export function accountOf(windows: readonly { kind: string; percentUsed: number }[]): Account {
-  const plan = windows.filter(w => w.kind === 'five_hour' || w.kind === 'seven_day')
+/** What the session's rate-limit windows say about the account. */
+export function accountKind(limits: readonly { kind: string; percentUsed: number }[]): Account {
+  const plan = limits.filter(l => /^(five_hour|seven_day)/.test(l.kind))
   if (plan.length === 0) return 'other'
-  return plan.some(w => w.percentUsed >= 100) ? 'credits' : 'subscription'
+  return plan.some(l => l.percentUsed >= 100) ? 'credits' : 'subscription'
 }
 
-export const ttlMs = (ttl: Ttl) => (ttl === '1h' ? 3_600_000 : 300_000)
-
-export function isCachingDisabled(model: string, env: CacheEnv): boolean {
-  if (isOn(env.disableAll)) return true
-  const name = model.toLowerCase()
-  if (name.includes('haiku')) return isOn(env.disableHaiku)
-  if (name.includes('sonnet')) return isOn(env.disableSonnet)
-  if (name.includes('opus')) return isOn(env.disableOpus)
-  return false
+/** What the lifetime is decided from, as read at session start. */
+export type LifetimeInputs = {
+  /** the ttl option: 'auto', '5m' or '1h' */
+  option: string
+  force5m?: string
+  envTtl?: string
+  settingTtl?: unknown
+  enable1h?: string
+  account: Account
 }
 
-export const promptTokens = (s: { read: number; write: number; fresh: number }) => s.read + s.write + s.fresh
+export type Lifetime = { ttl: number; source: string; pinned: boolean }
 
-export function hitRatio(s: { read: number; write: number; fresh: number }): number {
-  const total = promptTokens(s)
-  return total === 0 ? 0 : s.read / total
+const TRUTHY = new Set(['1', 'true', 'yes', 'on'])
+export const isTruthy = (v: string | undefined) => v !== undefined && TRUTHY.has(v.trim().toLowerCase())
+
+const ttlValue = (v: unknown): number | undefined => {
+  const s = typeof v === 'string' ? v.trim().toLowerCase() : ''
+  return s === '5m' ? 300 : s === '1h' ? 3600 : undefined
 }
 
-/** 0 for a request that touched no cache entry: nothing to count down. */
-export function remainingMs(s: Sample, ttl: Ttl, now: number): number {
-  if (s.read + s.write === 0) return 0
-  return Math.max(0, s.startedAt + ttlMs(ttl) - now)
+/** The cache lifetime before request timing has a say, first match wins. */
+export function baseLifetime(i: LifetimeInputs): Lifetime {
+  const option = ttlValue(i.option)
+  if (option) return { ttl: option, source: 'ttl option', pinned: true }
+  if (isTruthy(i.force5m)) return { ttl: 300, source: 'FORCE_PROMPT_CACHING_5M', pinned: false }
+  const env = ttlValue(i.envTtl)
+  if (env) return { ttl: env, source: 'CLAUDE_CODE_PROMPT_CACHE_TTL', pinned: false }
+  const setting = ttlValue(i.settingTtl)
+  if (setting) return { ttl: setting, source: 'promptCacheTtl setting', pinned: false }
+  if (isTruthy(i.enable1h)) return { ttl: 3600, source: 'ENABLE_PROMPT_CACHING_1H', pinned: false }
+  if (i.account === 'subscription') return { ttl: 3600, source: 'Claude subscription default', pinned: false }
+  if (i.account === 'credits') return { ttl: 300, source: 'usage credits (plan limit reached)', pinned: false }
+  return { ttl: 300, source: 'API key or cloud provider', pinned: false }
 }
 
-/** Why a request that should have read the cache wrote it instead; undefined when it did not miss. */
-export function missReason(prev: Sample | undefined, cur: Sample, ttl: Ttl): string | undefined {
-  if (!prev) return undefined
-  const before = promptTokens(prev)
-  // a prompt that shrank is /compact or /clear, not a miss
-  if (before === 0 || promptTokens(cur) < before * 0.7) return undefined
-  if (cur.read >= before * 0.5 || cur.write === 0) return undefined
-  if (cur.model !== prev.model) return `model changed (${prev.model} → ${cur.model})`
-  if (cur.startedAt - prev.startedAt > ttlMs(ttl)) return `the ${ttl} cache had lapsed`
+export const ttlLabel = (ttl: number) => (ttl >= 3600 && ttl % 3600 === 0 ? `${ttl / 3600}h` : `${Math.round(ttl / 60)}m`)
+
+/** The lifetime in force: the base one, corrected by what traffic showed unless the option pins it. */
+export function effectiveLifetime(base: Lifetime, observed: CacheObserved | null): Lifetime {
+  if (base.pinned || !observed) return base
+  if (observed.ttl === base.ttl) return { ...base, source: `${base.source}, confirmed by traffic` }
+  return { ttl: observed.ttl, source: `observed from request timing (${base.source} said ${ttlLabel(base.ttl)})`, pinned: false }
+}
+
+/** The variable that turns caching off for this model, or null. */
+export function cachingOff(env: { all?: string; haiku?: string; sonnet?: string; opus?: string }, model: string | undefined): string | null {
+  if (isTruthy(env.all)) return 'DISABLE_PROMPT_CACHING'
+  const m = (model ?? '').toLowerCase()
+  if (m.includes('haiku') && isTruthy(env.haiku)) return 'DISABLE_PROMPT_CACHING_HAIKU'
+  if (m.includes('sonnet') && isTruthy(env.sonnet)) return 'DISABLE_PROMPT_CACHING_SONNET'
+  if (m.includes('opus') && isTruthy(env.opus)) return 'DISABLE_PROMPT_CACHING_OPUS'
+  return null
+}
+
+// ---------------------------------------------------------------- reading traffic
+
+/*
+ * Thresholds, in one place:
+ * - a request READ MOST of what was cached when it read at least HALF of the
+ *   previous request's prompt (the prefix it shares with this one); less, with
+ *   something written, is a miss.
+ * - a prompt SHRANK when it is under HALF of the previous prompt: that is
+ *   /compact or /clear rebuilding a smaller conversation, not a miss.
+ * - SLACK covers clock jitter and the time a request takes to reach the cache:
+ *   a hit has to come more than 5 minutes + 20 s after the previous request to
+ *   prove that a 5-minute entry would not have survived.
+ */
+export const MOST = 0.5
+export const SHRANK = 0.5
+export const SLACK_MS = 20_000
+const FIVE_MIN_MS = 300_000
+const HOUR_MS = 3_600_000
+
+export const promptSize = (s: { read: number; write: number; fresh: number }) => s.read + s.write + s.fresh
+
+const shrank = (prev: CacheSample, cur: CacheSample) => promptSize(cur) < promptSize(prev) * SHRANK
+const readMost = (prev: CacheSample, cur: CacheSample) => cur.read >= promptSize(prev) * MOST
+
+/** What a request says about the lifetime, given the one before it: the updated observation (unchanged when it proves nothing). */
+export function observe(observed: CacheObserved | null, prev: CacheSample | undefined, cur: CacheSample): CacheObserved | null {
+  if (!prev || prev.model !== cur.model) return observed
+  const gap = cur.at - prev.at
+  if (gap <= FIVE_MIN_MS + SLACK_MS) return observed
+  if (cur.read > 0 && readMost(prev, cur)) return { ttl: 3600, proven: true }
+  const missed = cur.write > 0 && !readMost(prev, cur) && !shrank(prev, cur)
+  if (missed && gap < HOUR_MS && !observed?.proven) return { ttl: 300, proven: false }
+  return observed
+}
+
+/** Why a request wrote the cache instead of reading it, or null when it did not miss. */
+export function missCause(prev: CacheSample | undefined, cur: CacheSample, ttl: number): string | null {
+  if (!prev) return null
+  if (cur.read === 0 && cur.write === 0) return null
+  if (shrank(prev, cur)) return null
+  if (cur.write === 0 || readMost(prev, cur)) return null
+  if (prev.model !== cur.model) return `model changed (${prev.model} → ${cur.model})`
+  if (cur.at - prev.at > ttl * 1000) return `the ${ttlLabel(ttl)} cache had lapsed`
   return 'prompt prefix changed (effort, tools, system prompt or CLAUDE.md)'
 }
 
-export function advise(last: Sample | undefined, prev: Sample | undefined, policy: Policy, now: number, disabled: boolean): Advice {
-  if (disabled) return { kind: 'off', text: 'prompt caching is off for this model (DISABLE_PROMPT_CACHING*)' }
-  if (!last) return { kind: 'cold', text: 'no request yet: the first one writes the cache' }
-  if (last.read + last.write === 0) return { kind: 'uncached', text: 'not cached (prompt under the model minimum, or caching off)' }
-  const left = remainingMs(last, policy.ttl, now)
-  const size = promptTokens(last)
-  if (left <= 0) {
-    const left = policy.windowTokens ? ` (${remainingPct(size, policy.windowTokens)}% of window remaining)` : ''
-    return size >= policy.compactAtTokens
-      ? { kind: 'expired', text: `expired: next message rewrites ${fmtCount(size)} tokens${left}. /compact first, or /clear if done` }
-      : { kind: 'expired', text: `expired: ${fmtCount(size)} tokens to rebuild${left}, keep going` }
+// ---------------------------------------------------------------- the view
+
+export const hitPercent = (s: { read: number; write: number; fresh: number }) => {
+  const size = promptSize(s)
+  return size > 0 ? Math.round((s.read / size) * 100) : 0
+}
+
+/** % of the window left after a prompt of `size`, clamped 0..100. */
+export const windowLeftPct = (window: number, size: number) => Math.max(0, Math.min(100, Math.round((100 * (window - size)) / window)))
+
+export type ViewInputs = {
+  samples: readonly CacheSample[]
+  lifetime: Lifetime
+  off: string | null
+  window: number
+}
+
+function row(label: string, list: readonly CacheSample[]): CacheTurnRow {
+  const sum = { read: 0, write: 0, fresh: 0 }
+  for (const s of list) {
+    sum.read += s.read
+    sum.write += s.write
+    sum.fresh += s.fresh
   }
-  if (left <= policy.warnMs) return { kind: 'soon', text: 'expires soon: any message refreshes it for free' }
-  const miss = missReason(prev, last, policy.ttl)
-  if (miss) return { kind: 'miss', text: `cache missed: ${miss}` }
-  return { kind: 'warm', text: 'warm: keep going' }
+  return { label, steps: list.length, ...sum, hit: hitPercent(sum) }
 }
 
-export function fmtCount(n: number): string {
-  if (n < 1000) return String(n)
-  if (n < 100_000) return `${(n / 1000).toFixed(1).replace(/\.0$/, '')}k`
-  if (n < 1_000_000) return `${Math.round(n / 1000)}k`
-  return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`
+/** Everything the band and pane draw, computed once when a request arrives. */
+export function buildView(i: ViewInputs): CacheView {
+  const n = i.samples.length
+  const cur = i.samples[n - 1]
+  const prev = i.samples[n - 2]
+  let last: CacheLast | null = null
+  if (cur) {
+    const prompt = promptSize(cur)
+    last = {
+      at: cur.at,
+      model: cur.model,
+      read: cur.read,
+      write: cur.write,
+      fresh: cur.fresh,
+      output: cur.output,
+      prompt,
+      hit: hitPercent(cur),
+      uncached: cur.read === 0 && cur.write === 0,
+      cause: missCause(prev, cur, i.lifetime.ttl),
+    }
+  }
+  const turns: CacheSample[][] = []
+  for (const s of i.samples) {
+    const group = turns[turns.length - 1]
+    if (group && group[0]?.turnId === s.turnId) group.push(s)
+    else turns.push([s])
+  }
+  return {
+    ttl: i.lifetime.ttl,
+    ttlLabel: ttlLabel(i.lifetime.ttl),
+    source: i.lifetime.source,
+    off: i.off,
+    window: i.window,
+    windowLeft: i.window > 0 && last ? windowLeftPct(i.window, last.prompt) : null,
+    last,
+    rows: turns.map(t => row(String(t[0]?.turnNo ?? ''), t)),
+    total: row('all', i.samples),
+  }
 }
 
-/** m:ss, or h:mm:ss from an hour up. */
-export function fmtClock(ms: number): string {
-  const total = Math.max(0, Math.ceil(ms / 1000))
+/** Remaining cache life in ms: counted from the start of the last request, never below 0. */
+export const remainingMs = (start: number, ttl: number, now: number) => Math.max(0, start + ttl * 1000 - now)
+
+// ---------------------------------------------------------------- advice
+
+export type AdviceState = 'off' | 'cold' | 'uncached' | 'expired' | 'soon' | 'miss' | 'warm'
+export type Advice = { state: AdviceState; text: string }
+
+/** The window used for the /compact decision when the real one is not known. */
+export const ASSUMED_WINDOW = 200_000
+
+/** One line of advice for the view at `left` ms of cache life. */
+export function advise(view: CacheView, left: number, s: Pick<Config, 'warnSeconds' | 'compactWhenRemainingPct'>): Advice {
+  if (view.off) return { state: 'off', text: `off: prompt caching is off (${view.off})` }
+  const last = view.last
+  if (!last) return { state: 'cold', text: 'cold: no request yet' }
+  if (last.uncached) return { state: 'uncached', text: 'not cached: the prompt is under the model minimum, or caching is off' }
+  if (left <= 0) {
+    const pct = windowLeftPct(view.window > 0 ? view.window : ASSUMED_WINDOW, last.prompt)
+    const shown = view.window > 0 ? ` (${pct}% of window remaining)` : ''
+    const tail = pct <= s.compactWhenRemainingPct ? '. /compact first, or /clear if done' : ', keep going'
+    return { state: 'expired', text: `expired: the next message rebuilds ${formatCount(last.prompt)}${shown}${tail}` }
+  }
+  if (left <= s.warnSeconds * 1000) return { state: 'soon', text: 'expires soon: any message refreshes it' }
+  if (last.cause) return { state: 'miss', text: `miss: ${last.cause}` }
+  return { state: 'warm', text: 'warm: keep going' }
+}
+
+// ---------------------------------------------------------------- countdown and timer
+
+export type Steps = Pick<Config, 'warnSeconds' | 'tickSeconds' | 'finalTickSeconds'>
+
+/** The countdown step (ms) for `left` ms: tickSeconds outside the final stretch, finalTickSeconds inside it. */
+export const stepMs = (left: number, s: Steps) => (left > s.warnSeconds * 1000 ? s.tickSeconds : s.finalTickSeconds) * 1000
+
+/** The countdown: whole minutes rounded up while the step is a minute or more, else m:ss with the seconds rounded up. */
+export function countdownText(left: number, s: Steps): string {
+  if (stepMs(left, s) >= 60_000) return `${Math.ceil(left / 60_000)}m`
+  const total = Math.ceil(left / 1000)
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`
+}
+
+/**
+ * How long the timer sleeps from `left` ms: until the next step boundary (the
+ * countdown's next value), the start of the final stretch, or the next toast
+ * mark not yet shown, whichever comes first; null once nothing is left.
+ * `marks` are seconds, descending; `shown` how many of them are used up.
+ */
+export function nextDelay(left: number, s: Steps, marks: readonly number[] = [], shown = 0): number | null {
+  if (left <= 0) return null
+  const step = stepMs(left, s)
+  const warn = s.warnSeconds * 1000
+  let target = Math.floor((left - 1) / step) * step
+  if (left > warn) target = Math.max(target, warn)
+  const mark = marks.slice(shown).find(m => m * 1000 < left)
+  if (mark !== undefined) target = Math.max(target, mark * 1000)
+  return Math.max(1, left - Math.max(0, target))
+}
+
+/**
+ * The toast marks at `left` ms: every mark at or above it is passed; of the
+ * passed ones not shown yet, only the smallest (the newest) fires.
+ */
+export function takeMarks(marks: readonly number[], shown: number, left: number): { fire: number | undefined; shown: number } {
+  let passed = shown
+  while (passed < marks.length && (marks[passed] ?? 0) * 1000 >= left) passed++
+  const fire = passed > shown && left > 0 ? marks[passed - 1] : undefined
+  return { fire, shown: passed }
+}
+
+/** How many marks are already behind a countdown starting at `left` ms (they never fire). */
+export const marksBehind = (marks: readonly number[], left: number) => marks.filter(m => m * 1000 >= left).length
+
+/** A span as a toast says it: `1 hr`, `30 min`, `1:30`, `10s`. */
+export function spanWords(seconds: number): string {
+  if (seconds >= 3600 && seconds % 3600 === 0) return `${seconds / 3600} hr`
+  if (seconds >= 60 && seconds % 60 === 0) return `${seconds / 60} min`
+  if (seconds > 60) return `${Math.floor(seconds / 60)}:${String(Math.round(seconds % 60)).padStart(2, '0')}`
+  return `${seconds}s`
+}
+
+export function expiryToast(mark: number, prompt: number): string {
+  const action = mark > 10 ? `send a message to keep ${formatCount(prompt)} warm` : 'send a message now'
+  return `cache expires in ${spanWords(mark)}: ${action}`
+}
+
+/** The footer line, or undefined while there is nothing to say. */
+export function statusText(view: CacheView | null, left: number, s: Steps): string | undefined {
+  if (!view) return undefined
+  if (view.off) return 'cache: off'
+  if (!view.last) return undefined
+  if (view.last.uncached) return 'cache: not cached'
+  return `cache ${view.last.hit}% · ${left > 0 ? countdownText(left, s) : 'expired'}`
+}
+
+// ---------------------------------------------------------------- context window alerts
+
+/**
+ * The levels crossed at `pct` % remaining, and the one to announce: the lowest
+ * level newly crossed. A level stays announced only while the window is still
+ * at or below it, so climbing back above it (after /compact) re-arms it.
+ */
+export function crossLevels(levels: readonly number[], announced: readonly number[], pct: number): { announce: number | undefined; announced: number[] } {
+  const crossed = levels.filter(l => pct <= l)
+  const fresh = crossed.filter(l => !announced.includes(l))
+  return { announce: fresh.length ? Math.min(...fresh) : undefined, announced: crossed }
+}
+
+export function contextToast(pct: number, used: number, window: number, compactPct: number): string {
+  const hint = pct <= compactPct ? ' · /compact or /clear frees room' : ''
+  return `context: ${pct}% of window remaining (${formatCount(used)} of ${formatCount(window)} used)${hint}`
+}
+
+// ---------------------------------------------------------------- formats
+
+/** 300, 84.2k, 1.2M. */
+export function formatCount(n: number): string {
+  const v = Math.max(0, Math.round(n))
+  const short = (x: number) => x.toFixed(1).replace(/\.0$/, '')
+  if (v < 1000) return String(v)
+  if (v < 999_950) return `${short(v / 1000)}k`
+  return `${short(v / 1_000_000)}M`
+}
+
+/** 3:20, or 1:00:00 from an hour up; seconds rounded up. */
+export function formatClock(ms: number): string {
+  const total = Math.ceil(Math.max(0, ms) / 1000)
   const h = Math.floor(total / 3600)
   const m = Math.floor((total % 3600) / 60)
-  const s = total % 60
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`
+  const sec = String(total % 60).padStart(2, '0')
+  return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`
 }
 
-export function bar(ratio: number, width: number): string {
-  const filled = Math.round(Math.min(1, Math.max(0, ratio)) * width)
-  return '█'.repeat(filled) + '░'.repeat(width - filled)
-}
-
-export type TurnRow = { turnId: string; steps: number; read: number; write: number; fresh: number; output: number }
-
-/** Samples grouped by turn, oldest first, each turn's requests summed. */
-export function byTurn(samples: readonly Sample[]): TurnRow[] {
-  const rows: TurnRow[] = []
-  for (const s of samples) {
-    let row = rows[rows.length - 1]
-    if (!row || row.turnId !== s.turnId) {
-      row = { turnId: s.turnId, steps: 0, read: 0, write: 0, fresh: 0, output: 0 }
-      rows.push(row)
-    }
-    row.steps += 1
-    row.read += s.read
-    row.write += s.write
-    row.fresh += s.fresh
-    row.output += s.output
+/** Whole cells for each part, adding up to `cells`; a part above zero gets at least one cell when there is room. */
+export function splitCells(parts: readonly number[], cells: number): number[] {
+  const sum = parts.reduce((a, b) => a + Math.max(0, b), 0)
+  if (sum <= 0 || cells <= 0) return parts.map(() => 0)
+  const exact = parts.map(p => (Math.max(0, p) / sum) * cells)
+  const out = exact.map(Math.floor)
+  let left = cells - out.reduce((a, b) => a + b, 0)
+  const byFraction = exact.map((x, i) => ({ i, f: x - Math.floor(x) })).sort((a, b) => b.f - a.f)
+  for (const { i } of byFraction) {
+    if (left <= 0) break
+    out[i] = (out[i] ?? 0) + 1
+    left--
   }
-  return rows
-}
-
-/** Session totals across every kept request. */
-export function totals(samples: readonly Sample[]): TurnRow {
-  const t: TurnRow = { turnId: 'all', steps: 0, read: 0, write: 0, fresh: 0, output: 0 }
-  for (const s of samples) {
-    t.steps += 1
-    t.read += s.read
-    t.write += s.write
-    t.fresh += s.fresh
-    t.output += s.output
+  // a part above zero shows: take a cell from the widest part for each one left at zero
+  for (let i = 0; i < parts.length; i++) {
+    if ((parts[i] ?? 0) <= 0 || (out[i] ?? 0) > 0) continue
+    let widest = -1
+    for (let j = 0; j < out.length; j++) if ((out[j] ?? 0) > 1 && (widest < 0 || (out[j] ?? 0) > (out[widest] ?? 0))) widest = j
+    if (widest < 0) break
+    out[widest] = (out[widest] ?? 0) - 1
+    out[i] = 1
   }
-  return t
+  return out
 }
 
-export const fit = (text: string, width: number) => (text.length <= width ? text : `${text.slice(0, Math.max(0, width - 1))}…`)
-
-export const positive = (v: unknown, fallback: number) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : fallback)
-
-export const lifeRatio = (leftMs: number, ttl: Ttl) => Math.min(1, Math.max(0, leftMs / ttlMs(ttl)))
-
-/** Read / wrote / new segment widths over `width` cells: proportional, non-empty parts ≥ 1 cell, summing to width. */
-export function segments(read: number, write: number, fresh: number, width: number): [number, number, number] {
-  const total = read + write + fresh
-  if (total === 0 || width <= 0) return [0, 0, 0]
-  const parts: [number, number, number] = [read, write, fresh]
-  const cells = parts.map(p => (p > 0 ? Math.max(1, Math.round((p / total) * width)) : 0)) as [number, number, number]
-  let over = cells[0] + cells[1] + cells[2] - width
-  while (over !== 0) {
-    const i = (over > 0 ? cells.indexOf(Math.max(...cells)) : parts.indexOf(Math.max(...parts))) as 0 | 1 | 2
-    cells[i] += over > 0 ? -1 : 1
-    over += over > 0 ? -1 : 1
-  }
-  return cells
-}
-
-/** Default toast marks, seconds left, at least 4 s apart: Claude Code drops a toast within 2 s of the previous one. */
-export const DEFAULT_TOAST_AT = [60, 10, 5, 1]
-/** From here down a toast says "send a message now". */
-export const URGENT_SECS = 10
-
-const UNIT_SECONDS: Record<string, number> = { s: 1, m: 60, h: 3600 }
-
-/**
- * One time-left mark in seconds: "30m", "10s", "1h", "1.5m", or a bare number
- * meaning seconds ("90"). Undefined for anything else.
- */
-export function parseSpan(token: string): number | undefined {
-  const m = /^(\d+(?:\.\d+)?)\s*(h|hrs?|hours?|m|mins?|minutes?|s|secs?|seconds?)?$/i.exec(token.trim())
-  if (!m) return undefined
-  const unit = (m[2] ?? 's')[0]!.toLowerCase()
-  const secs = Math.round(Number(m[1]) * (UNIT_SECONDS[unit] ?? 1))
-  return secs > 0 ? secs : undefined
-}
-
-/** "30m, 15m, 5m, 1m" → [1800, 900, 300, 60]: seconds, unique, largest first; nothing valid → fallback. */
-export function parseMarks(v: unknown, fallback: readonly number[] = DEFAULT_TOAST_AT): number[] {
-  const raw = Array.isArray(v) ? v.map(String) : typeof v === 'string' ? v.split(/[,;]+/) : []
-  const marks = [...new Set(raw.map(parseSpan).filter((n): n is number => n !== undefined))]
-  return marks.length ? marks.sort((a, b) => b - a) : [...fallback]
-}
-
-/** Default context-alert levels, % of the window remaining. */
-export const DEFAULT_CONTEXT_ALERTS = [50, 25, 10]
-
-/** "75,50,25" → [75, 50, 25]: whole percentages 1–99, unique, largest first; "off" or "" → []; nothing valid → fallback. */
-export function parsePercents(v: unknown, fallback: readonly number[] = DEFAULT_CONTEXT_ALERTS): number[] {
-  if (typeof v !== 'string') return [...fallback]
-  const text = v.trim().toLowerCase()
-  if (text === '' || text === 'off' || text === 'none') return []
-  const marks = [...new Set(text.split(/[,;\s]+/).map(t => Number(t.replace('%', ''))).filter(n => Number.isFinite(n) && n > 0 && n < 100).map(n => Math.round(n)))]
-  return marks.length ? marks.sort((a, b) => b - a) : [...fallback]
-}
-
-/**
- * Context alerts: given the % of window remaining, the levels and those
- * already announced, which level to announce now (the lowest newly crossed,
- * once) and the updated announced set. A level whose line the context has
- * moved back above (after /compact or /clear) is re-armed.
- */
-export function contextAlert(remaining: number, levels: readonly number[], announced: readonly number[]): { level?: number; announced: number[] } {
-  const kept = announced.filter(m => remaining <= m)
-  const due = levels.filter(m => remaining <= m && !kept.includes(m))
-  if (!due.length) return { announced: kept }
-  return { level: Math.min(...due), announced: [...kept, ...due].sort((a, b) => b - a) }
-}
-
-/** Time left in words for a toast: "30 min", "1 hr", "1:30", "10s". */
-export function fmtSpan(secs: number): string {
-  if (secs >= 3600 && secs % 3600 === 0) return `${secs / 3600} hr`
-  if (secs >= 60 && secs % 60 === 0) return `${secs / 60} min`
-  if (secs >= 60) return fmtClock(secs * 1000)
-  return `${secs}s`
-}
-
-/** The toast mark due now, or undefined. `level` is the last mark fired for this entry (Infinity before any); a late tick skips to the newest mark. */
-export function nextToastMark(secsLeft: number, marks: readonly number[], level: number): number | undefined {
-  const due = marks.filter(m => secsLeft <= m && m < level)
-  return due.length ? Math.min(...due) : undefined
-}
-
-export type Pace = { tickMs: number; finalTickMs: number; warnMs: number }
-
-/** The countdown step in force: `tickMs` while more than `warnMs` is left, `finalTickMs` inside it. */
-export const periodFor = (leftMs: number, pace: Pace) => (leftMs > pace.warnMs ? pace.tickMs : pace.finalTickMs)
-
-/** Countdown text at the step in force: "59m" for steps of a minute or more, else m:ss rounded up to the step. */
-export function fmtCountdown(leftMs: number, pace: Pace): string {
-  if (leftMs <= 0) return '0:00'
-  const period = periodFor(leftMs, pace)
-  if (period >= 60_000) return `${Math.ceil(leftMs / 60_000)}m`
-  return fmtClock(Math.ceil(leftMs / period) * period)
-}
-
-/**
- * ms until the timer next has something to do: the countdown text changes, the
- * fast window starts, or a toast mark comes due. Never a fixed period, so a 1h
- * cache on the default pace wakes about 60 times in its last minute and once a
- * minute before that.
- */
-export function nextDelay(leftMs: number, pace: Pace, marks: readonly number[]): number {
-  if (leftMs <= 0) return 0
-  const period = periodFor(leftMs, pace)
-  let d = ((leftMs - 1) % period) + 1
-  if (leftMs > pace.warnMs) d = Math.min(d, leftMs - pace.warnMs)
-  for (const m of marks) {
-    const at = m * 1000
-    if (at < leftMs) d = Math.min(d, leftMs - at)
-  }
-  return Math.max(d, 20)
-}
-
-export type LifeColor = 'green' | 'yellow' | 'red'
-
-/** Green while plenty, yellow below 40% of the lifetime, red from the warning threshold. */
-export function lifeColor(leftMs: number, ttl: Ttl, warnMs: number): LifeColor {
-  if (leftMs <= warnMs) return 'red'
-  return leftMs / ttlMs(ttl) <= 0.4 ? 'yellow' : 'green'
-}
-
-// requests are timed from their start; slack keeps a hit just inside 5m from "proving" 1h
-const SLACK_MS = 10_000
-
-/**
- * What the traffic says about the lifetime:
- *   - a hit more than 5 minutes after the previous request proves 1h, and sticks
- *   - a miss 5–60 minutes later, same model, prompt not shrunk, says 5m (a later hit overrules)
- */
-export function observeTtl(prev: Sample | undefined, cur: Sample, known: Ttl | undefined): Ttl | undefined {
-  if (!prev || prev.read + prev.write === 0 || cur.model !== prev.model) return known
-  const gap = cur.startedAt - prev.startedAt
-  const before = promptTokens(prev)
-  if (gap <= ttlMs('5m') + SLACK_MS) return known
-  if (cur.read >= before * 0.5) return '1h'
-  if (known === '1h') return known
-  const lapsed = cur.write > 0 && promptTokens(cur) >= before * 0.7 && gap < ttlMs('1h') + SLACK_MS
-  return lapsed ? '5m' : known
+/** A bar of `cells` characters, `filled` of them solid. */
+export const textBar = (fraction: number, cells: number) => {
+  const filled = Math.max(0, Math.min(cells, Math.round(fraction * cells)))
+  return '█'.repeat(filled) + '░'.repeat(cells - filled)
 }

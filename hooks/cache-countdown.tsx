@@ -1,211 +1,336 @@
 /**
- * cache-countdown: a prompt-cache meter for Claude Code.
- *
- *   - turn.step: each main-loop request's usage (subagents skipped: own prefixes)
- *   - one self-scheduling $.clock.after timer, no fixed interval: it wakes only
- *     when the countdown text changes (every `tickSeconds`, default 60, then every
- *     `finalTickSeconds`, default 1, inside the last `warnSeconds`) or a toast is
- *     due. 1h cache on defaults: ~60 wakes in the last minute, one a minute before.
- *     It stops on expiry, no-cache or caching off, and restarts on the next request.
- *   - each tick writes one `tick` state value that only the band and the pane
- *     read, so a tick redraws those two sites and nothing else (no global
- *     ui.render invalidation, no transcript re-render)
- *   - ui.render: AbovePrompt band + the /cache Pane
- *   - samples and the observed TTL live in $.state, so a hot reload keeps them
- *
- * Options: ttl auto|5m|1h, warnSeconds, tickSeconds, finalTickSeconds, compactWhenRemainingPct,
- *          band, status, toast, toastAt, contextAlertsAt.
+ * cache-countdown: the wiring. turn.step records each main-loop request and
+ * builds the view the band and the pane draw from, once per request; one
+ * self-scheduling clock.after timer then carries only the time left, waking
+ * when the countdown text changes or a toast is due, and not at all once the
+ * cache has expired or caching is off. /cache opens the detail pane, /cache
+ * setup the walkthrough (setup.ts holds its pure half).
  */
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, Timer } from 'claude-code'
+import type { EngineInterface, Register, TurnUsage } from 'claude-code'
+
+import type { CacheSample, CacheView, SetupChange, SetupDraft } from '../types'
 import {
-  accountOf,
-  contextAlert,
-  parsePercents,
-  remainingPct,
-  DEFAULT_WINDOW,
-  pctOption,
-  usedAt,
+  accountKind,
   advise,
-  bar,
-  byTurn,
-  decideTtl,
-  fit,
-  fmtClock,
-  fmtCountdown,
-  fmtSpan,
-  fmtCount,
-  hitRatio,
-  isCachingDisabled,
-  lifeColor,
-  lifeRatio,
+  baseLifetime,
+  buildView,
+  cachingOff,
+  contextToast,
+  countdownText,
+  crossLevels,
+  effectiveLifetime,
+  expiryToast,
+  formatCount,
+  marksBehind,
   nextDelay,
-  nextToastMark,
-  parseMarks,
-  observeTtl,
-  positive,
-  promptTokens,
+  observe,
+  readConfig,
   remainingMs,
-  segments,
-  totals,
-  URGENT_SECS,
+  splitCells,
+  statusText,
+  takeMarks,
+  textBar,
 } from './cache'
-import type { Advice, CacheEnv, Pace, Sample, TtlChoice, Ttl } from './cache'
-import { changes, CUSTOM, decode, display, draftFromOptions, encode, FIELDS, isListed, PRESETS, REVIEW_STEP, STEP_COUNT } from './setup'
+import type { Account, AdviceState, Config, Lifetime } from './cache'
+import { CUSTOM, FIELDS, PRESETS, REVIEW_STEP, STEP_COUNT, changes, display, draftFromOptions, encode, isListed } from './setup'
 import type { Field } from './setup'
-import type { SetupChange, SetupDraft } from './setup'
 
 const PANE = 'cache'
 const SETUP = 'cache-setup'
-const COMMAND = 'cache'
-const KEEP = 200
+const MAX_SAMPLES = 200
 
+const TICK = { plugin: 'cache-countdown', key: 'tick' } as const
 const samplesAtom = atom({ plugin: 'cache-countdown', key: 'samples' } as const, [])
+const viewAtom = atom({ plugin: 'cache-countdown', key: 'view' } as const, null)
+const tickAtom = atom(TICK, 0)
 const observedAtom = atom({ plugin: 'cache-countdown', key: 'observed' } as const, null)
-const tickAtom = atom({ plugin: 'cache-countdown', key: 'tick' } as const, 0)
+const alertsAtom = atom({ plugin: 'cache-countdown', key: 'alerts' } as const, [])
 const paneAtom = atom({ plugin: 'cache-countdown', key: 'paneOpen' } as const, false)
 const draftAtom = atom({ plugin: 'cache-countdown', key: 'draft' } as const, null)
 const noteAtom = atom({ plugin: 'cache-countdown', key: 'setupNote' } as const, '')
 const pendingAtom = atom({ plugin: 'cache-countdown', key: 'pending' } as const, [])
 const stepAtom = atom({ plugin: 'cache-countdown', key: 'setupStep' } as const, 0)
-const alertedAtom = atom({ plugin: 'cache-countdown', key: 'alerted' } as const, [])
 
-const COLOR: Record<Advice['kind'], string | undefined> = {
-  warm: 'green',
-  soon: 'yellow',
-  expired: 'red',
-  miss: 'red',
-  off: undefined,
-  cold: undefined,
-  uncached: undefined,
-}
-const ICON: Record<Advice['kind'], string> = { warm: '●', soon: '▲', expired: '✖', miss: '✖', off: '○', cold: '○', uncached: '○' }
+// ---------------------------------------------------------------- module state (starts over on every load)
 
-const hitColor = (pct: number) => (pct >= 80 ? 'green' : pct >= 40 ? 'yellow' : 'red')
-
-type Config = {
-  warnMs: number
-  pace: Pace
-  toastAt: number[]
-  /** context-window alert levels, % of the window remaining; [] = off */
-  contextAlerts: number[]
-  /** an expired cache suggests /compact once the window remaining is at or below this percentage */
-  compactWhenRemainingPct: number
-  showBand: boolean
-  showStatus: boolean
-  wantToast: boolean
-  pinned: boolean
-  ttlOption: unknown
-}
-
-// module state: rebuilt by register + session.start on every load, so a hot reload loses nothing that matters
-let cfg: Config = {
-  warnMs: 60_000,
-  pace: { tickMs: 60_000, finalTickMs: 1_000, warnMs: 60_000 },
-  toastAt: parseMarks(undefined),
-  contextAlerts: [50, 25, 10],
-  compactWhenRemainingPct: 60, showBand: true, showStatus: false, wantToast: true, pinned: false, ttlOption: 'auto' }
-let env: CacheEnv = {}
-let setting: unknown
-let base: TtlChoice = decideTtl('auto', {})
-let timer: Timer | undefined
-let ticking = false
-let rerun = false
-let lastStatus: string | undefined
-let toastedFor = 0
-let toastLevel = Infinity
-// the session model's context window, from the status line's figures; 0 until reported
-let windowTokens = 0
-// the options this load runs with: what settings hold, defaults filled in
+/** the options as stored (the walkthrough compares against these) */
 let current: Readonly<Record<string, unknown>> = {}
+/** the options, checked and parsed */
+let cfg: Config = readConfig({})
 
-type Snapshot = { samples: Sample[]; last: Sample | undefined; ttl: Ttl; source: string; advice: Advice; left: number }
+type Environment = { ttl?: string; force5m?: string; enable1h?: string; off: { all?: string; haiku?: string; sonnet?: string; opus?: string } }
+let env: Environment = { off: {} }
+let settingTtl: unknown
+let account: Account = 'other'
+let contextWindow = 0
 
-async function snapshot($: EngineInterface, now: number): Promise<Snapshot> {
-  const samples = (await read($, samplesAtom)) as Sample[]
-  const observed = (await read($, observedAtom)) as Ttl | null
-  const useObserved = !cfg.pinned && observed !== null
-  const ttl: Ttl = useObserved ? observed : base.ttl
-  const source = useObserved
-    ? observed === base.ttl
-      ? `${base.source}, confirmed by traffic`
-      : `observed from request timing; ${base.source} said ${base.ttl}`
-    : base.source
-  const last = samples[samples.length - 1]
-  const prev = samples[samples.length - 2]
-  const disabled = isCachingDisabled(last?.model ?? '', env)
-  const window = windowTokens || DEFAULT_WINDOW
-  const compactAtTokens = usedAt(window, cfg.compactWhenRemainingPct)
-  const advice = advise(last, prev, { ttl, warnMs: cfg.warnMs, compactAtTokens, windowTokens: windowTokens || undefined }, now, disabled)
-  const left = last && !disabled ? remainingMs(last, ttl, now) : 0
-  return { samples, last, ttl, source, advice, left }
+let timer: ReturnType<EngineInterface['clock']['after']> | null = null
+let busy = false
+let again = false
+/** bumped by every stop, so a wake already under way does not schedule another */
+let epoch = 0
+/** how many of cfg.marks the current countdown has used up */
+let shown = 0
+let lastStatus: string | undefined
+let paneShown = false
+
+// ---------------------------------------------------------------- reading the world
+
+async function readEnvironment($: EngineInterface) {
+  const [ttl, force5m, enable1h, all, haiku, sonnet, opus] = await Promise.all([
+    $.env.get('CLAUDE_CODE_PROMPT_CACHE_TTL'),
+    $.env.get('FORCE_PROMPT_CACHING_5M'),
+    $.env.get('ENABLE_PROMPT_CACHING_1H'),
+    $.env.get('DISABLE_PROMPT_CACHING'),
+    $.env.get('DISABLE_PROMPT_CACHING_HAIKU'),
+    $.env.get('DISABLE_PROMPT_CACHING_SONNET'),
+    $.env.get('DISABLE_PROMPT_CACHING_OPUS'),
+  ])
+  env = { ttl, force5m, enable1h, off: { all, haiku, sonnet, opus } }
+  const merged = await $.settings.read().catch(() => ({}) as Readonly<Record<string, unknown>>)
+  settingTtl = merged.promptCacheTtl
 }
 
-function shortLine(s: Snapshot): string {
-  if (!s.last || s.advice.kind === 'off') return `cache: ${s.advice.kind}`
-  return `cache ${Math.round(hitRatio(s.last) * 100)}%${s.left > 0 ? ` · ${fmtCountdown(s.left, cfg.pace)}` : ' · expired'}`
+async function refreshUsage($: EngineInterface) {
+  try {
+    const usage = await $.session.usage()
+    contextWindow = usage.context && usage.context.window > 0 ? usage.context.window : 0
+    account = accountKind(usage.rateLimits ?? [])
+  } catch {
+    // keep the last reading
+  }
 }
+
+const baseNow = (): Lifetime =>
+  baseLifetime({ option: cfg.ttl, force5m: env.force5m, envTtl: env.ttl, settingTtl, enable1h: env.enable1h, account })
+
+/** Rebuilds the view from the kept samples and stores it: once per request, at load and on /clear. */
+async function rebuild($: EngineInterface): Promise<CacheView> {
+  const samples = await read($, samplesAtom)
+  const lifetime = effectiveLifetime(baseNow(), await read($, observedAtom))
+  const view = buildView({ samples, lifetime, off: cachingOff(env.off, samples.at(-1)?.model), window: contextWindow })
+  await update($, viewAtom, () => view)
+  return view
+}
+
+// ---------------------------------------------------------------- per request
+
+async function recordStep($: EngineInterface, turnId: string, model: string, at: number, usage: TurnUsage) {
+  const samples = await read($, samplesAtom)
+  const prev = samples.at(-1)
+  const sample: CacheSample = {
+    at,
+    turnId,
+    turnNo: prev ? (prev.turnId === turnId ? prev.turnNo : prev.turnNo + 1) : 1,
+    model: usage.model || model,
+    read: usage.cache_read_input_tokens ?? 0,
+    write: usage.cache_creation_input_tokens ?? 0,
+    fresh: usage.input_tokens ?? 0,
+    output: usage.output_tokens ?? 0,
+  }
+  await update($, samplesAtom, list => [...list, sample].slice(-MAX_SAMPLES))
+  await refreshUsage($)
+  if (!baseNow().pinned) {
+    const before = await read($, observedAtom)
+    const after = observe(before, prev, sample)
+    if (after !== before) await update($, observedAtom, () => after)
+  }
+  const view = await rebuild($)
+  await checkContext($, view)
+  $.ui.log(
+    `step read=${sample.read} write=${sample.write} new=${sample.fresh} model=${sample.model} ttl=${view.ttlLabel} source=${view.source} window=${contextWindow || 'unknown'}`,
+    { to: 'debug' },
+  )
+  await restartCountdown($, view)
+}
+
+async function checkContext($: EngineInterface, view: CacheView) {
+  if (!view.last || view.windowLeft === null || cfg.levels.length === 0) return
+  const before = await read($, alertsAtom)
+  const { announce, announced } = crossLevels(cfg.levels, before, view.windowLeft)
+  if (announced.join() !== before.join()) await update($, alertsAtom, () => announced)
+  if (announce !== undefined) $.ui.toast(contextToast(view.windowLeft, view.last.prompt, view.window, cfg.compactWhenRemainingPct))
+}
+
+// ---------------------------------------------------------------- the timer
 
 function stopTimer() {
+  epoch++
+  again = false
   timer?.cancel()
-  timer = undefined
+  timer = null
 }
 
-async function tick($: EngineInterface) {
-  // a tick asked for while one runs runs once after it, never alongside
-  if (ticking) {
-    rerun = true
+const isLive = (view: CacheView | null): view is CacheView & { last: NonNullable<CacheView['last']> } =>
+  !!view && !!view.last && !view.off && !view.last.uncached
+
+/** A new countdown (a request arrived, or the module loaded): every mark still ahead is armed again. */
+async function restartCountdown($: EngineInterface, view: CacheView) {
+  stopTimer()
+  if (!isLive(view)) {
+    await setStatus($, statusText(view, 0, cfg))
     return
   }
-  ticking = true
+  shown = marksBehind(cfg.marks, remainingMs(view.last.at, view.ttl, await $.clock.now()))
+  await tick($)
+}
+
+/** One wake at a time; a wake asked for during one runs once right after it. */
+async function tick($: EngineInterface) {
+  if (busy) {
+    again = true
+    return
+  }
+  busy = true
   try {
-    const now = await $.clock.now()
-    const s = await snapshot($, now)
-    const secs = Math.ceil(s.left / 1000)
-    if (cfg.showBand || (await read($, paneAtom))) await update($, tickAtom, () => secs)
-    if (cfg.showStatus) {
-      const line = shortLine(s)
-      if (line !== lastStatus) {
-        lastStatus = line
-        $.ui.status(line)
-      }
-    }
-    // cache-expiry toasts are independent of the context window: they fire at the marks whenever toasts are on
-    const toasting = cfg.wantToast && !!s.last && s.left > 0
-    if (toasting && s.last) {
-      if (toastedFor !== s.last.startedAt) {
-        toastedFor = s.last.startedAt
-        toastLevel = Infinity
-      }
-      const mark = nextToastMark(secs, cfg.toastAt, toastLevel)
-      if (mark !== undefined) {
-        toastLevel = mark
-        const tail = secs <= URGENT_SECS ? 'send a message now' : `send a message to keep ${fmtCount(promptTokens(s.last))} tokens warm`
-        $.ui.toast(`cache expires in ${fmtSpan(secs)}: ${tail}`)
-      }
-    }
-    // nothing left to count: stop until the next request; else sleep until the next thing to do
-    if (s.left <= 0) stopTimer()
-    else schedule($, nextDelay(s.left, cfg.pace, toasting ? cfg.toastAt : []))
+    do {
+      again = false
+      timer?.cancel()
+      timer = null
+      const mine = epoch
+      const delay = await wake($)
+      if (!again && delay !== null && mine === epoch) timer = $.clock.after(delay, () => void tick($))
+    } while (again)
   } finally {
-    ticking = false
-    if (rerun) {
-      rerun = false
-      void tick($).catch(stopTimer)
-    }
+    busy = false
   }
 }
 
-function schedule($: EngineInterface, delay: number) {
-  timer?.cancel()
-  // a tick that fails (engine refused a write, module unloading) stops the timer rather than retrying
-  timer = $.clock.after(delay, () => void tick($).catch(stopTimer))
+/** What one wake does: the toast due, the time left for the band and pane, the footer line; then how long to sleep. */
+async function wake($: EngineInterface): Promise<number | null> {
+  const view = await read($, viewAtom)
+  if (!isLive(view)) {
+    await setStatus($, statusText(view, 0, cfg))
+    return null
+  }
+  const left = remainingMs(view.last.at, view.ttl, await $.clock.now())
+  if (cfg.toast) {
+    const due = takeMarks(cfg.marks, shown, left)
+    shown = due.shown
+    if (due.fire !== undefined) $.ui.toast(expiryToast(due.fire, view.last.prompt))
+  }
+  if (cfg.band || paneShown) await $.state.set(TICK, left)
+  await setStatus($, statusText(view, left, cfg))
+  // nothing to draw and nothing to announce: sleep until a request or /cache asks again
+  if (!cfg.toast && !cfg.status && !cfg.band && !paneShown) return null
+  return nextDelay(left, cfg, cfg.toast ? cfg.marks : [], shown)
 }
 
-function startTimer($: EngineInterface) {
-  stopTimer()
-  void tick($).catch(stopTimer)
+async function setStatus($: EngineInterface, text: string | undefined) {
+  if (!cfg.status || text === lastStatus) return
+  lastStatus = text
+  $.ui.status(text)
 }
+
+// ---------------------------------------------------------------- session
+
+async function startSession($: EngineInterface) {
+  stopTimer()
+  shown = 0
+  lastStatus = undefined
+  await readEnvironment($)
+  await refreshUsage($)
+  await $.command.register({
+    name: 'cache',
+    description: 'Prompt cache meter: countdown, last request, per-turn table',
+    argumentHint: '[setup|stop]',
+    immediate: true,
+  })
+  paneShown = await read($, paneAtom)
+  const view = await rebuild($)
+  const off = view.off ? `, prompt caching is off (${view.off})` : ''
+  $.ui.log(`cache-countdown loaded: ${view.ttlLabel} cache (${view.source})${off}, /cache opens the pane`, { to: 'debug' })
+  await applyPending($)
+  await firstRun($)
+  await restartCountdown($, view)
+}
+
+async function firstRun($: EngineInterface) {
+  const seen = await $.store.get('setupSeen').catch(() => true)
+  if (seen) return
+  $.ui.toast('cache-countdown is on: /cache setup walks through its settings')
+  await $.store.set('setupSeen', true).catch(() => undefined)
+}
+
+async function clearSession($: EngineInterface) {
+  stopTimer()
+  shown = 0
+  await update($, samplesAtom, () => [])
+  await update($, observedAtom, () => null)
+  await update($, alertsAtom, () => [])
+  await rebuild($)
+  if (cfg.status || lastStatus !== undefined) $.ui.status(undefined)
+  lastStatus = undefined
+}
+
+// ---------------------------------------------------------------- /cache
+
+async function setPane($: EngineInterface, open: boolean) {
+  paneShown = open
+  if ((await read($, paneAtom)) !== open) await update($, paneAtom, () => open)
+}
+
+async function closePane($: EngineInterface) {
+  await $.ui.close({ id: PANE }).catch(() => undefined)
+  await setPane($, false)
+}
+
+async function openPane($: EngineInterface): Promise<string> {
+  await $.ui.open({ id: PANE, title: 'cache', columns: 64, rows: 24, focus: true, closeOnEscape: true })
+  await setPane($, true)
+  const view = await read($, viewAtom)
+  const left = view?.last ? remainingMs(view.last.at, view.ttl, await $.clock.now()) : 0
+  // the pane draws from the tick: a live countdown wakes now (and writes it), anything else writes it once
+  if (isLive(view) && left > 0) await tick($)
+  else await $.state.set(TICK, left)
+  if (!view) return 'cache: not read yet · /cache stop closes'
+  return `${view.ttlLabel} cache (${view.source}) · ${advise(view, left, cfg).text} · /cache stop closes`
+}
+
+async function runCommand($: EngineInterface, args: string): Promise<{ text: string }> {
+  const word = args.trim().toLowerCase()
+  if (word === 'setup') {
+    await openSetup($)
+    return { text: 'cache setup opened: start from a preset, adjust each setting, then Save' }
+  }
+  if (word === 'stop') {
+    await closePane($)
+    return { text: 'cache pane closed' }
+  }
+  return { text: await openPane($) }
+}
+
+// ---------------------------------------------------------------- drawing helpers
+
+const STATE_COLOR: Record<AdviceState, string> = {
+  off: 'gray',
+  cold: 'gray',
+  uncached: 'gray',
+  expired: 'red',
+  soon: 'red',
+  miss: 'yellow',
+  warm: 'green',
+}
+
+/** green while plenty is left, yellow in the last third, red in the final stretch */
+function clockColor(left: number, ttl: number): string {
+  if (left <= cfg.warnSeconds * 1000) return 'red'
+  return left <= (ttl * 1000) / 3 ? 'yellow' : 'green'
+}
+
+/** what the setup walkthrough shows as "Detected now" */
+async function snapshot($: EngineInterface, now: number) {
+  const view = await read($, viewAtom)
+  const left = view?.last ? remainingMs(view.last.at, view.ttl, now) : 0
+  return {
+    ttl: view ? (view.off ? 'off' : view.ttlLabel) : 'unknown',
+    source: view ? (view.off ?? view.source) : 'not read yet',
+    left,
+  }
+}
+
+// ---------------------------------------------------------------- setup walkthrough: actions
 
 /**
  * One config.set per option, each with its key spelled out, so anyone reading the
@@ -309,172 +434,178 @@ async function presetSetup($: EngineInterface, draft: SetupDraft) {
   await update($, draftAtom, () => ({ ...draft }))
 }
 
-/** One status-line read: the model's context window, and the account when it decides the TTL. */
-async function refreshUsage($: EngineInterface) {
-  const usage = await $.session.usage().catch(() => undefined)
-  if (usage && usage.context.window > 0) windowTokens = usage.context.window
-  const first = decideTtl(cfg.ttlOption, env, setting)
-  base = first.byAccount ? decideTtl(cfg.ttlOption, env, setting, accountOf(usage?.rateLimits ?? [])) : first
-}
+// ---------------------------------------------------------------- hooks
 
 export const register: Register = (on, options) => {
   current = options
-  const warnMsOpt = positive(options.warnSeconds, 60) * 1000
-  cfg = {
-    warnMs: warnMsOpt,
-    pace: {
-      tickMs: positive(options.tickSeconds, 60) * 1000,
-      finalTickMs: positive(options.finalTickSeconds, 1) * 1000,
-      warnMs: warnMsOpt,
-    },
-    toastAt: parseMarks(options.toastAt),
-    contextAlerts: parsePercents(options.contextAlertsAt),
-    compactWhenRemainingPct: pctOption(options.compactWhenRemainingPct, 60),
-    showBand: options.band !== false,
-    showStatus: options.status === true,
-    wantToast: options.toast !== false,
-    pinned: options.ttl === '5m' || options.ttl === '1h',
-    ttlOption: options.ttl,
-  }
-  const { warnMs, showBand, showStatus, pinned } = cfg
+  cfg = readConfig(options)
 
   on('session.start', async ($, e, next) => {
-    const r = await next(e)
-    toastedFor = 0
-    toastLevel = Infinity
-    lastStatus = undefined
-    const none = () => undefined
-    const [enable1h, force5m, ttlVar, disableAll, disableHaiku, disableSonnet, disableOpus] = await Promise.all([
-      $.env.get('ENABLE_PROMPT_CACHING_1H').catch(none),
-      $.env.get('FORCE_PROMPT_CACHING_5M').catch(none),
-      $.env.get('CLAUDE_CODE_PROMPT_CACHE_TTL').catch(none),
-      $.env.get('DISABLE_PROMPT_CACHING').catch(none),
-      $.env.get('DISABLE_PROMPT_CACHING_HAIKU').catch(none),
-      $.env.get('DISABLE_PROMPT_CACHING_SONNET').catch(none),
-      $.env.get('DISABLE_PROMPT_CACHING_OPUS').catch(none),
-    ])
-    env = { enable1h, force5m, ttlVar, disableAll, disableHaiku, disableSonnet, disableOpus }
-    // merged over user, project, local, --settings and managed policy, as the engine runs
-    setting = (await $.settings.read().catch(() => ({}) as Record<string, unknown>)).promptCacheTtl
-    await refreshUsage($)
-
-    await $.command
-      .register({
-        name: COMMAND,
-        description: 'Prompt-cache meter: countdown, last request, per-turn table (/cache setup configures, /cache stop closes)',
-        argumentHint: '[setup|stop]',
-        immediate: true,
-      })
-      .catch(err => $.ui.log(`cache-countdown: /${COMMAND} not registered: ${err}`, { to: 'debug' }))
-    $.ui.log(`cache-countdown loaded: ${base.ttl} cache (${base.source}), /${COMMAND} opens the pane`, { to: 'debug' })
-
-    // the wizard's remaining writes, if a write's reload cut the last load short
-    await applyPending($).catch(err => $.ui.log(`cache-countdown: settings not written: ${err}`, { to: 'debug' }))
-    // a newcomer hears about the wizard once, ever
-    const seen = await $.store.get('setupSeen').catch(() => true)
-    if (!seen) {
-      $.ui.toast(`cache-countdown: /${COMMAND} setup picks the countdown step, toasts and more`)
-      await $.store.set('setupSeen', true).catch(() => undefined)
-    }
-
-    // after a hot reload the samples are still in $.state: resume a live countdown
-    stopTimer()
-    const s = await snapshot($, await $.clock.now())
-    if (s.left > 0) startTimer($)
-    return r
+    const started = await next(e)
+    await startSession($)
+    return started
   })
 
   on('session.end', async ($, e, next) => {
-    stopTimer()
     if (e.reason === 'clear') {
-      // /clear starts a new conversation: a new cache
-      await update($, samplesAtom, () => [])
-      await update($, observedAtom, () => null)
-      await update($, alertedAtom, () => [])
-      toastedFor = 0
-      toastLevel = Infinity
-      if (showStatus) {
-        lastStatus = undefined
-        $.ui.status(undefined)
+      try {
+        await clearSession($)
+      } catch (err) {
+        $.ui.log(`cache-countdown: reset after /clear failed (${String(err)})`, { to: 'debug' })
       }
     }
     return next(e)
   })
 
   on('turn.step', async function* ($, e, next) {
+    // subagents have cache prefixes of their own: their requests say nothing about this one
     if (e.agentId) return yield* next(e)
-    const startedAt = await $.clock.now()
-    const r = yield* next(e)
-    if (!r.usage) return r
-    const sample: Sample = {
-      turnId: e.turnId,
-      index: e.index,
-      model: r.usage.model || e.model,
-      startedAt,
-      read: r.usage.cache_read_input_tokens ?? 0,
-      write: r.usage.cache_creation_input_tokens ?? 0,
-      fresh: r.usage.input_tokens ?? 0,
-      output: r.usage.output_tokens ?? 0,
-    }
-    let prev: Sample | undefined
-    await update($, samplesAtom, list => {
-      const all = list as Sample[]
-      prev = all[all.length - 1]
-      const grown = [...all, sample]
-      return grown.length > KEEP ? grown.slice(-KEEP) : grown
-    })
-    // the window (model switches) and the account (a subscription running out of plan usage) can change mid-session
-    await refreshUsage($)
-    if (!pinned) {
-      const known = ((await read($, observedAtom)) as Ttl | null) ?? undefined
-      const seen = observeTtl(prev, sample, known)
-      if (seen !== known) await update($, observedAtom, () => seen ?? null)
-    }
-    // context-window alerts: a toast as the conversation crosses each fill level, independent of the cache
-    if (windowTokens > 0 && cfg.contextAlerts.length) {
-      const used = promptTokens(sample)
-      const left = remainingPct(used, windowTokens)
-      const announced = (await read($, alertedAtom)) as number[]
-      const alert = contextAlert(left, cfg.contextAlerts, announced)
-      if (alert.announced.join() !== announced.join()) await update($, alertedAtom, () => alert.announced)
-      if (alert.level !== undefined) {
-        const tight = left <= cfg.compactWhenRemainingPct ? ' · /compact or /clear frees room' : ''
-        $.ui.toast(`context: ${left}% of window remaining (${fmtCount(used)} of ${fmtCount(windowTokens)} used)${tight}`)
+    const at = await $.clock.now()
+    const result = yield* next(e)
+    if (result.usage) {
+      try {
+        await recordStep($, e.turnId, e.model, at, result.usage)
+      } catch (err) {
+        $.ui.log(`cache-countdown: could not record a request (${String(err)})`, { to: 'debug' })
       }
     }
-    $.ui.log(
-      `cache-countdown: step read=${sample.read} write=${sample.write} new=${sample.fresh} model=${sample.model} ttl=${base.ttl} (${base.source}) window=${windowTokens}`,
-      { to: 'debug' },
+    return result
+  })
+
+  on('command.run', { command: 'cache' }, async ($, e) => runCommand($, e.args))
+
+  on('ui.close', { id: PANE }, async ($, e, next) => {
+    const closed = await next(e)
+    await setPane($, false).catch(() => undefined)
+    return closed
+  })
+
+  // the meter row above the input box
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (!cfg.band || e.props.hasSurvey) return next(e)
+    const view = await read($, viewAtom)
+    if (!view) return next(e)
+    const { Box, Text } = $.ui.resolve(e)
+    if (view.off && !view.last) {
+      return (
+        <Box flexDirection="row">
+          <Text dimColor wrap="truncate-end">{`cache · ${advise(view, 0, cfg).text}`}</Text>
+        </Box>
+      )
+    }
+    if (await read($, paneAtom)) return next(e)
+    const last = view.last
+    if (!last) return next(e)
+    const left = await read($, tickAtom)
+    const advice = advise(view, left, cfg)
+    const wide = e.props.bodyColumns >= 90
+    const timed = advice.state !== 'off' && advice.state !== 'uncached'
+    // the figures never shrink or wrap; only the advice tail gives way on a narrow body
+    return (
+      <Box flexDirection="row" columnGap={1}>
+        <Box flexDirection="row" columnGap={1} flexShrink={0}>
+          <Text color={STATE_COLOR[advice.state]}>●</Text>
+          <Text bold color="cyan">cache</Text>
+          <Text color={STATE_COLOR[advice.state]}>{textBar(last.hit / 100, wide ? 10 : 6)}</Text>
+          <Text bold>{`${last.hit}%`}</Text>
+          {wide ? <Text color="green">{`read ${formatCount(last.read)}`}</Text> : <Text dimColor>{`prompt ${formatCount(last.prompt)}`}</Text>}
+          {wide ? <Text color="yellow">{`wrote ${formatCount(last.write)}`}</Text> : null}
+          {wide ? <Text color="blue">{`new ${formatCount(last.fresh)}`}</Text> : null}
+          {timed ? <Text bold color={clockColor(left, view.ttl)}>{`⏱ ${countdownText(left, cfg)}`}</Text> : null}
+        </Box>
+        <Text dimColor wrap="truncate-end">{view.off ? advice.text : `${view.ttlLabel} · ${advice.text}`}</Text>
+      </Box>
     )
-    startTimer($)
-    return r
   })
 
-  on('command.run', { command: COMMAND }, async ($, e) => {
-    const arg = e.args.trim().toLowerCase()
-    if (arg === 'setup') {
-      await openSetup($)
-      return { text: 'setup opened: pick, then Save (writes your Claude Code settings, as /config does)' }
+  // the /cache pane
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const view = await read($, viewAtom)
+    const left = await read($, tickAtom)
+    const { Box, Text, Button } = $.ui.resolve(e)
+    // remote surfaces collapse runs of spaces; no-break spaces keep aligned text aligned
+    const aligned = (text: string) => (e.surface === 'terminal' ? text : text.replace(/ /g, ' '))
+    const width = Math.max(32, Math.min(e.props.bodyColumns || 64, 80))
+    const close = <Button key="close" label="close" role="dismiss" onPress={() => void closePane($)} />
+    if (!view) {
+      return (
+        <Box flexDirection="column">
+          <Text bold color="cyan">PROMPT CACHE</Text>
+          <Text dimColor>not read yet</Text>
+          {close}
+        </Box>
+      )
     }
-    if (arg === 'stop') {
-      await $.ui.close({ id: PANE }).catch(() => undefined)
-      await update($, paneAtom, () => false)
-      return { text: 'cache pane closed' }
-    }
-    await update($, paneAtom, () => true)
-    await $.ui.open({ id: PANE, title: 'cache', focus: true, closeOnEscape: true, columns: 64, rows: 24 })
-    const s = await snapshot($, await $.clock.now())
-    if (s.left > 0) startTimer($)
-    return { text: `${s.ttl} cache (${s.source}) · ${s.advice.text} · /${COMMAND} stop closes` }
+    const advice = advise(view, left, cfg)
+    const last = view.last
+    const ttlMs = view.ttl * 1000
+    const lifeCells = Math.max(10, width - 24)
+    const barCells = Math.max(10, width - 2)
+    const parts = last ? splitCells([last.read, last.write, last.fresh], barCells) : []
+    const colors = ['green', 'yellow', 'blue']
+    const room = Math.max(1, (e.props.scroll?.bodyRows ?? 24) - 15)
+    const rows = view.rows.slice(-room)
+    const COLS = [6, 7, 9, 9, 9, 6]
+    const cells = (key: string, values: string[], bold?: boolean) => (
+      <Box key={key} flexDirection="row">
+        {values.map((v, i) => (
+          <Box key={`${key}:${i}`} width={COLS[i] ?? 8} justifyContent={i === 0 ? 'flex-start' : 'flex-end'}>
+            <Text bold={bold}>{v}</Text>
+          </Box>
+        ))}
+      </Box>
+    )
+    return (
+      <Box flexDirection="column">
+        <Box key="title" flexDirection="column">
+          <Text bold color="cyan">PROMPT CACHE</Text>
+          <Text dimColor wrap="wrap">{view.off ? `off · ${view.off}` : `${view.ttlLabel} lifetime · ${view.source}`}</Text>
+        </Box>
+        {isLive(view) ? (
+          <Box key="life" flexDirection="row" columnGap={1} marginTop={1}>
+            <Text color={clockColor(left, view.ttl)}>{left > 0 ? `⏱ ${countdownText(left, cfg)} left` : '⏱ expired'}</Text>
+            <Text color={clockColor(left, view.ttl)}>{textBar(left / ttlMs, lifeCells)}</Text>
+            <Text>{`${Math.round((100 * left) / ttlMs)}%`}</Text>
+          </Box>
+        ) : null}
+        <Box key="advice" flexDirection="column" marginTop={isLive(view) ? 0 : 1}>
+          <Text color={STATE_COLOR[advice.state]} wrap="wrap">{advice.text}</Text>
+          <Text dimColor>{last ? `${last.model} · prompt ${formatCount(last.prompt)} tokens` : 'no request yet'}</Text>
+        </Box>
+        {last ? (
+          <Box key="last" flexDirection="column" marginTop={1}>
+            <Box flexDirection="row" justifyContent="space-between" width={barCells}>
+              <Text bold>last request</Text>
+              <Text>{`${last.hit}% hit`}</Text>
+            </Box>
+            <Box flexDirection="row">
+              {parts.map((n, i) => (n > 0 ? <Box key={`seg:${i}`} width={n} height={1} backgroundColor={colors[i] ?? 'gray'} /> : null))}
+            </Box>
+            <Box flexDirection="row" columnGap={2}>
+              <Text color="green">{`■ read ${formatCount(last.read)}`}</Text>
+              <Text color="yellow">{`■ wrote ${formatCount(last.write)}`}</Text>
+              <Text color="blue">{`■ new ${formatCount(last.fresh)}`}</Text>
+            </Box>
+          </Box>
+        ) : null}
+        {view.rows.length ? (
+          <Box key="turns" flexDirection="column" marginTop={1}>
+            {cells('head', ['turn', 'steps', 'read', 'wrote', 'new', 'hit'], true)}
+            {rows.map(r =>
+              cells(`turn:${r.label}`, [r.label, String(r.steps), formatCount(r.read), formatCount(r.write), formatCount(r.fresh), `${r.hit}%`]),
+            )}
+            {cells('all', [view.total.label, String(view.total.steps), formatCount(view.total.read), formatCount(view.total.write), formatCount(view.total.fresh), `${view.total.hit}%`], true)}
+          </Box>
+        ) : null}
+        <Box key="foot" flexDirection="row" columnGap={2} marginTop={1}>
+          {close}
+          <Text dimColor>{aligned('Esc or /cache stop closes')}</Text>
+        </Box>
+      </Box>
+    )
   })
 
-  on('ui.close', async ($, e, next) => {
-    const r = await next(e)
-    if (e.id === PANE) await update($, paneAtom, () => false)
-    if (e.id === SETUP) await update($, draftAtom, () => null)
-    return r
-  })
-
+  // the /cache setup walkthrough
   on('ui.render', { component: 'Pane', requestId: SETUP }, async ($, e) => {
     const draft = ((await read($, draftAtom)) as SetupDraft | null) ?? draftFromOptions(current)
     const step = Math.max(0, Math.min(REVIEW_STEP, (await read($, stepAtom)) as number))
@@ -596,144 +727,6 @@ export const register: Register = (on, options) => {
           ) : null}
         </Box>
         {nav}
-      </Box>
-    )
-  })
-
-  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (!showBand || e.props.hasSurvey) return next(e)
-    if (await read($, paneAtom)) return next(e)
-    await read($, tickAtom) // subscribes the band to the countdown
-    const s = await snapshot($, await $.clock.now())
-    const { last, advice, left, ttl } = s
-    if (!last && advice.kind !== 'off') return next(e)
-    const { Box, Text } = $.ui.resolve(e)
-    const columns = e.props.bodyColumns
-    const color = COLOR[advice.kind]
-
-    if (!last) return <Text dimColor>{fit(`cache: ${advice.text}`, columns)}</Text>
-
-    const ratio = hitRatio(last)
-    const wide = columns >= 90
-    const counting = advice.kind !== 'uncached' && advice.kind !== 'off'
-    return (
-      <Box flexDirection="row" columnGap={1}>
-        <Text bold color={color}>{ICON[advice.kind]}</Text>
-        <Text bold color="cyan">cache</Text>
-        <Text color={color}>{bar(ratio, wide ? 10 : 6)}</Text>
-        <Text bold>{`${Math.round(ratio * 100)}%`}</Text>
-        {/* siblings, not a fragment: the terminal lays a fragment out as a column */}
-        {wide && <Text color="green">{`read ${fmtCount(last.read)}`}</Text>}
-        {wide && <Text color="yellow">{`wrote ${fmtCount(last.write)}`}</Text>}
-        {wide && <Text color="cyan">{`new ${fmtCount(last.fresh)}`}</Text>}
-        {!wide && <Text dimColor>{`${fmtCount(promptTokens(last))} tok`}</Text>}
-        {counting && <Text bold color={left > 0 ? lifeColor(left, ttl, warnMs) : 'red'}>{`⏱ ${fmtCountdown(left, cfg.pace)}`}</Text>}
-        <Text dimColor wrap="truncate-end">{`${ttl} · ${advice.text}`}</Text>
-      </Box>
-    )
-  })
-
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button } = $.ui.resolve(e)
-    await read($, tickAtom)
-    const width = Math.max(30, e.props.bodyColumns - 1)
-    // HTML collapses runs of spaces; a no-break space keeps columns aligned on desktop
-    const sp = (t: string) => (e.surface === 'terminal' ? t : t.replace(/ /g, ' '))
-    const s = await snapshot($, await $.clock.now())
-    const { last, advice, left, ttl, source, samples } = s
-    const turns = byTurn(samples)
-    const sum = totals(samples)
-    const counting = !!last && advice.kind !== 'uncached' && advice.kind !== 'off'
-    const clockColor = counting ? lifeColor(left, ttl, warnMs) : undefined
-    const stateColor = advice.kind === 'expired' || advice.kind === 'miss' ? 'red' : (clockColor ?? COLOR[advice.kind])
-
-    // solid bars are filled Boxes, not block characters: no seams on desktop
-    const solid = (key: string, parts: [number, string | undefined][]) => (
-      <Box key={key} flexDirection="row" height={1} flexShrink={0}>
-        {parts.map(([w, c], i) => (w > 0 ? <Box key={`${key}:${i}`} width={w} height={1} flexShrink={0} backgroundColor={c} /> : null))}
-      </Box>
-    )
-    const cell = (key: string, w: number, text: string, c?: string, bold = false) => (
-      <Box key={key} width={w} flexShrink={0} justifyContent="flex-end">
-        <Text color={c} bold={bold} dimColor={!c}>{sp(text)}</Text>
-      </Box>
-    )
-    const row = (key: string, label: string, r: { steps: number; read: number; write: number; fresh: number }, strong = false) => {
-      const pct = Math.round(hitRatio(r) * 100)
-      return (
-        <Box key={key} flexDirection="row" columnGap={1}>
-          {cell(`${key}:n`, 5, label, strong ? 'cyan' : undefined, strong)}
-          {cell(`${key}:s`, 5, String(r.steps))}
-          {cell(`${key}:r`, 6, fmtCount(r.read), 'green')}
-          {cell(`${key}:w`, 6, fmtCount(r.write), 'yellow')}
-          {cell(`${key}:f`, 5, fmtCount(r.fresh), 'cyan')}
-          {cell(`${key}:h`, 4, `${pct}%`, hitColor(pct), true)}
-        </Box>
-      )
-    }
-
-    const barW = Math.min(width, 40)
-    const life = lifeRatio(left, ttl)
-    const lifeFilled = Math.round(life * barW)
-    const [sr, sw, sn] = last ? segments(last.read, last.write, last.fresh, barW) : [0, 0, 0]
-    const shown = turns.slice(-Math.max(3, (e.viewport?.rows ?? 24) - 18))
-    const lastPct = last ? Math.round(hitRatio(last) * 100) : 0
-
-    return (
-      <Box flexDirection="column">
-        <Box key="title" flexDirection="row" columnGap={1}>
-          <Text bold color="cyan">{sp('PROMPT CACHE')}</Text>
-          <Text dimColor wrap="truncate-end">{sp(`· ${ttl} lifetime (${source})`)}</Text>
-        </Box>
-
-        <Box key="clock" flexDirection="column" marginTop={1}>
-          <Text bold color={clockColor}>{sp(counting ? `⏱ ${fmtCountdown(left, cfg.pace)} left` : '⏱ --:--')}</Text>
-          {counting ? (
-            <Box flexDirection="row" columnGap={1}>
-              {solid('life', [[lifeFilled, clockColor], [barW - lifeFilled, 'gray']])}
-              <Text dimColor>{sp(`${Math.round(life * 100)}%`)}</Text>
-            </Box>
-          ) : null}
-        </Box>
-
-        <Box key="advice" marginTop={1} flexDirection="column">
-          <Text bold color={stateColor}>{sp(`${ICON[advice.kind]} ${advice.text}`)}</Text>
-          {last ? <Text dimColor>{sp(fit(`${last.model} · prompt ${fmtCount(promptTokens(last))} tokens`, width))}</Text> : null}
-        </Box>
-
-        {last ? (
-          <Box key="stack" flexDirection="column" marginTop={1}>
-            <Text dimColor>{sp('last request')}</Text>
-            <Box flexDirection="row" columnGap={1}>
-              {solid('stack', [[sr, 'green'], [sw, 'yellow'], [sn, 'cyan']])}
-              <Text bold color={hitColor(lastPct)}>{sp(`${lastPct}% hit`)}</Text>
-            </Box>
-            <Box flexDirection="row" columnGap={2}>
-              <Text color="green">{sp(`■ read ${fmtCount(last.read)}`)}</Text>
-              <Text color="yellow">{sp(`■ wrote ${fmtCount(last.write)}`)}</Text>
-              <Text color="cyan">{sp(`■ new ${fmtCount(last.fresh)}`)}</Text>
-            </Box>
-          </Box>
-        ) : null}
-
-        <Box key="table" flexDirection="column" marginTop={1}>
-          <Box key="head" flexDirection="row" columnGap={1}>
-            {cell('h:turn', 5, 'turn', 'cyan', true)}
-            {cell('h:steps', 5, 'steps', 'cyan', true)}
-            {cell('h:read', 6, 'read', 'green', true)}
-            {cell('h:wrote', 6, 'wrote', 'yellow', true)}
-            {cell('h:new', 5, 'new', 'cyan', true)}
-            {cell('h:hit', 4, 'hit', 'magenta', true)}
-          </Box>
-          {shown.length === 0 ? <Text dimColor>{sp('no requests yet')}</Text> : null}
-          {shown.map((t, i) => row(`t:${t.turnId}`, String(turns.length - shown.length + i + 1), t))}
-          {turns.length > 0 ? row('total', 'all', sum, true) : null}
-        </Box>
-
-        <Box key="foot" marginTop={1} flexDirection="row" columnGap={2}>
-          <Button key="close" label="close" role="dismiss" onPress={() => void $.ui.close({ id: PANE })} />
-          <Text dimColor>{sp('read: from cache · wrote: new entry · new: uncached')}</Text>
-        </Box>
       </Box>
     )
   })

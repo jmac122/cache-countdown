@@ -10,7 +10,7 @@
       "name": "cache-countdown",
       "source": "./",
       "description": "Prompt-cache meter above the prompt: hit %, read/wrote/new tokens, TTL countdown, advice and expiry toasts. /cache opens a detail pane; /cache setup configures it.",
-      "version": "0.1.2",
+      "version": "0.1.3",
       "author": { "name": "jmac122", "url": "https://github.com/jmac122" },
       "homepage": "https://github.com/jmac122/cache-countdown",
       "category": "productivity"

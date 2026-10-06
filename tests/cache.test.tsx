@@ -1,91 +1,244 @@
-// Run with: claude plugin test <this mod's folder>
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
-import type { On } from 'claude-code'
-import {
-  accountOf,
-  advise,
-  decideTtl,
-  fmtClock,
-  fmtCountdown,
-  nextDelay,
-  parseMarks,
-  parseSpan,
-  fmtSpan,
-  fmtCount,
-  missReason,
-  nextToastMark,
-  observeTtl,
-  remainingMs,
-  segments,
-  totals,
-} from '../hooks/cache'
-import type { Pace, Policy, Sample } from '../hooks/cache'
-import { changes, draftFromOptions, PRESETS, splitToasts, toastsRow } from '../hooks/setup'
+import type { On, TurnUsage } from 'claude-code'
 
-const T0 = 1_000_000_000_000
+import {
+  accountKind,
+  advise,
+  baseLifetime,
+  buildView,
+  countdownText,
+  effectiveLifetime,
+  formatClock,
+  formatCount,
+  missCause,
+  nextDelay,
+  observe,
+  parseMarks,
+  parsePercents,
+  parseSpan,
+  remainingMs,
+  spanWords,
+  splitCells,
+  takeMarks,
+} from '../hooks/cache'
+import type { Lifetime } from '../hooks/cache'
+import { PRESETS, changes, draftFromOptions, splitToasts, toastsRow } from '../hooks/setup'
+import type { CacheSample } from '../types'
+
+const PLUGIN = 'cache-countdown'
+const SURFACES = ['terminal', 'desktop'] as const
+const T0 = 1_000_000
 const MIN = 60_000
-const policy: Policy = { ttl: '5m', warnMs: 60_000, compactAtTokens: 100_000 }
-const sample = (over: Partial<Sample> = {}): Sample => ({
-  turnId: 't1',
-  index: 0,
-  model: 'claude-sonnet-5-5',
-  startedAt: T0,
-  read: 80_000,
-  write: 1_000,
-  fresh: 500,
-  output: 300,
-  ...over,
+const STEPS = { warnSeconds: 60, tickSeconds: 60, finalTickSeconds: 1 }
+const ADVICE = { warnSeconds: 60, compactWhenRemainingPct: 60 }
+
+// ---------------------------------------------------------------- helpers
+
+type WorldOptions = {
+  env?: Record<string, string>
+  window?: number
+  limits?: { kind: string; percentUsed: number }[]
+  settings?: Record<string, unknown>
+  store?: Record<string, unknown>
+}
+
+type World = {
+  clock: MockClock
+  toasts: string[]
+  logs: string[]
+  statuses: (string | undefined)[]
+  /** writes of the band/pane tick: one per wake that had someone to draw for */
+  ticks: number
+  usage: TurnUsage[]
+}
+
+/** Everything beneath the plugin: each `$` call it makes is answered here. */
+function world(on: On, o: WorldOptions = {}): World {
+  const w: World = { clock: mock.clock(on, { now: T0 }), toasts: [], logs: [], statuses: [], ticks: 0, usage: [] }
+  mock.env(on, o.env ?? {})
+  mock.store(on, o.store ?? { setupSeen: true })
+  on('ui.render', () => ({ type: 'Box', props: {}, children: [] }) as never)
+  on('ui.toast', ($, e) => {
+    w.toasts.push(e.text)
+    return { value: undefined } as never
+  })
+  on('ui.log', ($, e) => {
+    w.logs.push(e.text)
+    return { value: undefined } as never
+  })
+  on('ui.status', ($, e) => {
+    w.statuses.push(e.text)
+    return { value: undefined } as never
+  })
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  on('ui.close', () => ({ value: undefined }) as never)
+  on('ui.focus', () => ({ value: {} }) as never)
+  on('command.register', () => ({ value: { command: 'cache' } }) as never)
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: o.window ?? 0 }, rateLimits: o.limits ?? [] } }) as never)
+  on('settings.read', () => ({ value: o.settings ?? {} }) as never)
+  on('session.start', ($, e) => ({ cwd: e.cwd }) as never)
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }) as never)
+  on('state.set', ($, e, pass) => {
+    if (e.plugin === PLUGIN && e.key === 'tick') w.ticks++
+    return pass(e)
+  })
+  on('turn.step', async function* ($, e) {
+    const usage = w.usage.shift() ?? null
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage } as never
+  })
+  return w
+}
+
+async function start($: Engine) {
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true } as never)
+}
+
+type Request = { read: number; write: number; fresh: number; model?: string; turnId?: string; agentId?: string }
+
+/** One model request through turn.step, read to its end. */
+async function request($: Engine, w: World, r: Request) {
+  const model = r.model ?? 'claude-opus-4-5'
+  w.usage.push({ model, input_tokens: r.fresh, output_tokens: 50, cache_read_input_tokens: r.read, cache_creation_input_tokens: r.write })
+  const stream = $.turn.step({ turnId: r.turnId ?? 't1', index: 0, model, messageCount: 3, ...(r.agentId ? { agentId: r.agentId } : {}) } as never)
+  for await (const chunk of stream) void chunk
+}
+
+const TYPICAL = { read: 80_000, write: 1_000, fresh: 300 }
+
+function band($: Engine, surface: (typeof SURFACES)[number] = 'terminal', bodyColumns = 120) {
+  return $.ui.mount({
+    plugin: PLUGIN,
+    surface,
+    component: 'AbovePrompt',
+    props: { hasSurvey: false, isWorking: false, maxRows: 6, bodyColumns, scroll: { offset: 0, bodyRows: 6 }, view: {} } as never,
+  })
+}
+
+function pane($: Engine, surface: (typeof SURFACES)[number] = 'terminal') {
+  return $.ui.mount({
+    plugin: PLUGIN,
+    surface,
+    component: 'Pane',
+    requestId: 'cache',
+    props: { title: 'cache', isFocused: true, bodyColumns: 64, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } as never,
+  })
+}
+
+const cacheToasts = (w: World) => w.toasts.filter(t => t.startsWith('cache expires'))
+const contextToasts = (w: World) => w.toasts.filter(t => t.startsWith('context:'))
+
+const sample = (at: number, read: number, write: number, fresh = 300, model = 'opus', turnId = 't1', turnNo = 1): CacheSample => ({
+  at,
+  turnId,
+  turnNo,
+  model,
+  read,
+  write,
+  fresh,
+  output: 10,
 })
 
-describe('pure logic', () => {
-  test('TTL follows the documented order', () => {
-    expect(decideTtl('1h', { force5m: '1' }, '5m', 'other').ttl).toBe('1h')
-    expect(decideTtl('auto', { force5m: '1', ttlVar: '1h' }, '1h', 'subscription').source).toBe('FORCE_PROMPT_CACHING_5M')
-    expect(decideTtl('auto', { ttlVar: '5m', enable1h: '1' }, '1h', 'subscription').source).toBe('CLAUDE_CODE_PROMPT_CACHE_TTL')
-    expect(decideTtl('auto', { enable1h: '1' }, '5m', 'other').source).toBe('promptCacheTtl setting')
-    expect(decideTtl('auto', { enable1h: '1' }, undefined, 'other').ttl).toBe('1h')
-    expect(decideTtl('auto', {}, 'junk', 'subscription')).toEqual({ ttl: '1h', source: 'Claude subscription default', byAccount: true })
-    expect(decideTtl('auto', {}, undefined, 'credits').ttl).toBe('5m')
-    expect(accountOf([{ kind: 'five_hour', percentUsed: 20 }])).toBe('subscription')
-    expect(accountOf([{ kind: 'five_hour', percentUsed: 100 }])).toBe('credits')
-    expect(accountOf([{ kind: 'spend_limit', percentUsed: 10 }])).toBe('other')
+const FIVE: Lifetime = { ttl: 300, source: 'test', pinned: false }
+const HOUR: Lifetime = { ttl: 3600, source: 'test', pinned: false }
+const viewOf = (samples: CacheSample[], lifetime: Lifetime = FIVE, window = 0, off: string | null = null) => buildView({ samples, lifetime, off, window })
+
+// ---------------------------------------------------------------- pure logic
+
+describe('cache lifetime', () => {
+  test('ttl order: option, FORCE_5M, env var, setting, ENABLE_1H, account', () => {
+    expect(baseLifetime({ option: '1h', force5m: '1', account: 'other' })).toEqual({ ttl: 3600, source: 'ttl option', pinned: true })
+    expect(baseLifetime({ option: 'auto', force5m: 'true', envTtl: '1h', settingTtl: '1h', account: 'subscription' })).toMatchObject({ ttl: 300, source: 'FORCE_PROMPT_CACHING_5M' })
+    expect(baseLifetime({ option: 'auto', envTtl: '5m', enable1h: '1', account: 'subscription' })).toMatchObject({ ttl: 300, source: 'CLAUDE_CODE_PROMPT_CACHE_TTL' })
+    expect(baseLifetime({ option: 'auto', settingTtl: '5m', enable1h: 'yes', account: 'subscription' })).toMatchObject({ ttl: 300, source: 'promptCacheTtl setting' })
+    expect(baseLifetime({ option: 'auto', enable1h: 'ON', account: 'other' })).toMatchObject({ ttl: 3600, source: 'ENABLE_PROMPT_CACHING_1H' })
+    expect(baseLifetime({ option: 'auto', settingTtl: '15m', envTtl: 'soon', force5m: '0', account: 'subscription' })).toMatchObject({ ttl: 3600, source: 'Claude subscription default' })
+    expect(baseLifetime({ option: 'junk', account: 'credits' })).toMatchObject({ ttl: 300 })
+    expect(baseLifetime({ option: 'auto', account: 'other' })).toMatchObject({ ttl: 300 })
   })
 
-  test('advice: warm, soon, expired; big context suggests /compact', () => {
-    const s = sample()
-    expect(advise(s, undefined, policy, T0 + 10_000, false).kind).toBe('warm')
-    expect(advise(s, undefined, policy, T0 + 250_000, false).kind).toBe('soon')
-    expect(advise(s, undefined, policy, T0 + 300_000, false).kind).toBe('expired')
-    expect(advise(sample({ read: 150_000 }), undefined, policy, T0 + 400_000, false).text).toContain('/compact')
-    expect(advise(sample(), undefined, policy, T0, true).kind).toBe('off')
-    expect(advise(sample({ read: 0, write: 0 }), undefined, policy, T0, false).kind).toBe('uncached')
-    expect(remainingMs(s, '1h', T0 + 100_000)).toBe(3_500_000)
+  test('account inference from the rate-limit windows', () => {
+    expect(accountKind([{ kind: 'five_hour', percentUsed: 20 }])).toBe('subscription')
+    expect(accountKind([{ kind: 'five_hour', percentUsed: 30 }, { kind: 'seven_day', percentUsed: 100 }])).toBe('credits')
+    expect(accountKind([{ kind: 'spend_limit', percentUsed: 40 }])).toBe('other')
+    expect(accountKind([])).toBe('other')
   })
 
-  test('misses name their cause; /compact is not a miss', () => {
-    const prev = sample({ read: 50_000, write: 1_000, fresh: 200 })
-    const wrote = { read: 0, write: 52_000, fresh: 300 }
-    expect(missReason(prev, sample({ ...wrote, model: 'claude-opus-5-5', startedAt: T0 + 20_000 }), '5m')).toContain('model changed')
-    expect(missReason(prev, sample({ ...wrote, startedAt: T0 + 400_000 }), '5m')).toContain('had lapsed')
-    expect(missReason(prev, sample({ ...wrote, startedAt: T0 + 20_000 }), '5m')).toContain('prefix changed')
-    expect(missReason(prev, sample({ read: 0, write: 8_000, fresh: 100 }), '5m')).toBeUndefined()
+  test('observation corrects the base unless pinned, and says so', () => {
+    const base = baseLifetime({ option: 'auto', account: 'other' })
+    expect(effectiveLifetime(base, { ttl: 3600, proven: true })).toMatchObject({ ttl: 3600, source: expect.stringContaining('observed from request timing') })
+    expect(effectiveLifetime(base, { ttl: 300, proven: false }).source).toBe('API key or cloud provider, confirmed by traffic')
+    expect(effectiveLifetime({ ttl: 300, source: 'ttl option', pinned: true }, { ttl: 3600, proven: true })).toMatchObject({ ttl: 300, source: 'ttl option' })
   })
 
-  test('toast marks fire once each, in order; a late tick skips to the newest', () => {
-    const marks = parseMarks('60, 10, 3, 1')
-    expect(marks).toEqual([60, 10, 3, 1])
-    let level = Infinity
+  test('observed lifetime from request timing', () => {
+    const prev = sample(0, 80_000, 1_000)
+    expect(observe(null, prev, sample(20 * MIN, 81_000, 500))).toEqual({ ttl: 3600, proven: true })
+    expect(observe(null, prev, sample(7 * MIN, 0, 81_300))).toEqual({ ttl: 300, proven: false })
+    expect(observe(null, prev, sample(2 * MIN, 0, 81_300))).toBeNull()
+    // a proven 1h is not undone by a later miss
+    expect(observe({ ttl: 3600, proven: true }, prev, sample(7 * MIN, 0, 81_300))).toEqual({ ttl: 3600, proven: true })
+    // a different model proves nothing
+    expect(observe(null, prev, sample(20 * MIN, 81_000, 500, 300, 'sonnet'))).toBeNull()
+  })
+})
+
+describe('advice', () => {
+  const view = viewOf([sample(0, 80_000, 1_000)])
+  test('warm, soon, expired on a 5m cache', () => {
+    expect(advise(view, remainingMs(0, 300, 10_000), ADVICE)).toMatchObject({ state: 'warm', text: expect.stringMatching(/^warm/) })
+    expect(advise(view, remainingMs(0, 300, 250_000), ADVICE)).toMatchObject({ state: 'soon', text: expect.stringMatching(/^expires soon.*any message refreshes it/) })
+    expect(advise(view, remainingMs(0, 300, 300_000), ADVICE).state).toBe('expired')
+  })
+
+  test('a big expired prompt suggests /compact; window shown when known', () => {
+    const big = viewOf([sample(0, 180_000, 5_000)])
+    expect(advise(big, 0, ADVICE).text).toContain('/compact')
+    expect(advise(big, 0, ADVICE).text).not.toContain('% of window')
+    expect(advise(viewOf([sample(0, 80_000, 1_000)], FIVE, 1_000_000), 0, ADVICE).text).toContain('92% of window remaining), keep going')
+    expect(advise(viewOf([sample(0, 80_000, 1_000)], FIVE, 120_000), 0, ADVICE).text).toContain('32% of window remaining). /compact first')
+  })
+
+  test('off, uncached, cold', () => {
+    expect(advise(viewOf([sample(0, 80_000, 1_000)], FIVE, 0, 'DISABLE_PROMPT_CACHING'), 100_000, ADVICE)).toMatchObject({ state: 'off', text: expect.stringContaining('prompt caching is off') })
+    expect(advise(viewOf([sample(0, 0, 0, 500)]), 100_000, ADVICE)).toMatchObject({ state: 'uncached', text: expect.stringContaining('not cached') })
+    expect(advise(viewOf([]), 0, ADVICE).state).toBe('cold')
+  })
+
+  test('remaining counts from the start of the last request', () => {
+    expect(remainingMs(0, 3600, 100_000)).toBe(3_500_000)
+    expect(remainingMs(0, 300, 400_000)).toBe(0)
+  })
+
+  test('miss causes', () => {
+    const prev = sample(0, 80_000, 1_000, 300, 'opus')
+    expect(missCause(prev, sample(MIN, 0, 81_000, 300, 'sonnet'), 300)).toBe('model changed (opus → sonnet)')
+    expect(missCause(prev, sample(7 * MIN, 0, 81_000), 300)).toBe('the 5m cache had lapsed')
+    expect(missCause(prev, sample(MIN, 2_000, 79_000), 300)).toContain('prompt prefix changed')
+    expect(missCause(prev, sample(MIN, 0, 9_000), 300)).toBeNull()
+    expect(missCause(prev, sample(MIN, 81_000, 400), 300)).toBeNull()
+    expect(advise(viewOf([prev, sample(MIN, 0, 81_000, 300, 'sonnet')]), 200_000, ADVICE).text).toBe('miss: model changed (opus → sonnet)')
+  })
+})
+
+describe('toast marks', () => {
+  test('ticking each second fires each mark once, in order', () => {
+    const marks = [60, 10, 3, 1]
+    let shown = 0
     const fired: number[] = []
-    for (let secs = 70; secs >= 1; secs--) {
-      const m = nextToastMark(secs, marks, level)
-      if (m !== undefined) {
-        fired.push(secs)
-        level = m
-      }
+    for (let s = 70; s >= 1; s--) {
+      const r = takeMarks(marks, shown, s * 1000)
+      shown = r.shown
+      if (r.fire !== undefined) fired.push(r.fire)
     }
     expect(fired).toEqual([60, 10, 3, 1])
-    expect(nextToastMark(2, marks, Infinity)).toBe(3)
+  })
+
+  test('a late tick fires only the newest mark passed', () => {
+    expect(takeMarks([60, 10, 3, 1], 0, 2_000)).toEqual({ fire: 3, shown: 3 })
+  })
+
+  test('parsing marks and spans', () => {
     expect(parseMarks('junk')).toEqual([60, 10, 5, 1])
     expect(parseMarks('5,300,5')).toEqual([300, 5])
     expect(parseMarks('30m, 15m, 5m, 1m')).toEqual([1800, 900, 300, 60])
@@ -95,290 +248,331 @@ describe('pure logic', () => {
     expect(parseSpan('1.5 min')).toBe(90)
     expect(parseSpan('90')).toBe(90)
     expect(parseSpan('5x')).toBeUndefined()
-    expect(fmtSpan(1800)).toBe('30 min')
-    expect(fmtSpan(3600)).toBe('1 hr')
-    expect(fmtSpan(90)).toBe('1:30')
-    expect(fmtSpan(10)).toBe('10s')
+    expect(parsePercents('75, 50, 25, 10, 5')).toEqual([75, 50, 25, 10, 5])
+    expect(parsePercents('off')).toEqual([])
+    expect(parsePercents('')).toEqual([])
+    expect(parsePercents('junk')).toEqual([50, 25, 10])
   })
 
-  test('pace: minute steps, then seconds in the final stretch; the timer sleeps until the next change', () => {
-    const pace: Pace = { tickMs: 60_000, finalTickMs: 1_000, warnMs: 60_000 }
-    expect(fmtCountdown(3_582_000, pace)).toBe('60m')
-    expect(fmtCountdown(3_540_000, pace)).toBe('59m')
-    expect(fmtCountdown(61_000, pace)).toBe('2m')
-    expect(fmtCountdown(60_000, pace)).toBe('1:00')
-    expect(fmtCountdown(42_300, pace)).toBe('0:43')
-    expect(fmtCountdown(0, pace)).toBe('0:00')
-    // 59:42 left: next change at 59:00, 42 s away
-    expect(nextDelay(3_582_000, pace, [])).toBe(42_000)
-    // 1:30 left: the final stretch starts in 30 s
-    expect(nextDelay(90_000, pace, [])).toBe(30_000)
-    // inside it, every second
-    expect(nextDelay(42_000, pace, [])).toBe(1_000)
-    // a toast mark outside the stretch wakes it too
-    expect(nextDelay(400_000, pace, [300])).toBe(40_000)
-    const fine: Pace = { tickMs: 1_000, finalTickMs: 1_000, warnMs: 60_000 }
-    expect(fmtCountdown(3_582_000, fine)).toBe('59:42')
-  })
-
-  test('observed TTL: a late hit proves 1h; a late miss says 5m', () => {
-    const prev = sample()
-    expect(observeTtl(prev, sample({ startedAt: T0 + 20 * MIN }), undefined)).toBe('1h')
-    expect(observeTtl(prev, sample({ startedAt: T0 + 7 * MIN, read: 0, write: 81_000 }), undefined)).toBe('5m')
-    expect(observeTtl(prev, sample({ startedAt: T0 + 2 * MIN, read: 0, write: 81_000 }), undefined)).toBeUndefined()
-  })
-
-  test('formatting, segments, totals', () => {
-    expect(fmtClock(200_000)).toBe('3:20')
-    expect(fmtClock(3_600_000)).toBe('1:00:00')
-    expect(fmtCount(84_200)).toBe('84.2k')
-    const seg = segments(113_000, 4_000, 2, 40)
-    expect(seg[0] + seg[1] + seg[2]).toBe(40)
-    expect(seg[2]).toBeGreaterThanOrEqual(1)
-    expect(totals([sample(), sample({ turnId: 't2' })]).read).toBe(160_000)
+  test('span words', () => {
+    expect(spanWords(1800)).toBe('30 min')
+    expect(spanWords(3600)).toBe('1 hr')
+    expect(spanWords(90)).toBe('1:30')
+    expect(spanWords(10)).toBe('10s')
   })
 })
 
-// ---- the module end to end, against the engine's own $ with a mocked clock ----
+describe('countdown and timer', () => {
+  test('countdown text with 60s / 1s steps', () => {
+    expect(countdownText(3_582_000, STEPS)).toBe('60m')
+    expect(countdownText(3_540_000, STEPS)).toBe('59m')
+    expect(countdownText(61_000, STEPS)).toBe('2m')
+    expect(countdownText(60_000, STEPS)).toBe('1:00')
+    expect(countdownText(42_300, STEPS)).toBe('0:43')
+    expect(countdownText(0, STEPS)).toBe('0:00')
+    expect(countdownText(3_582_000, { ...STEPS, tickSeconds: 1 })).toBe('59:42')
+  })
 
-type World = { toasts: string[]; status: (string | undefined)[]; logs: string[]; ticks: number; clock: MockClock }
+  test('next delay: the next change of the text, the final stretch, or a mark', () => {
+    expect(nextDelay(3_582_000, STEPS)).toBe(42_000)
+    expect(nextDelay(90_000, STEPS)).toBe(30_000)
+    expect(nextDelay(42_000, STEPS)).toBe(1_000)
+    expect(nextDelay(400_000, STEPS, [300], 0)).toBe(40_000)
+    expect(nextDelay(330_000, STEPS, [315], 0)).toBe(15_000)
+    expect(nextDelay(0, STEPS)).toBeNull()
+  })
+})
 
-function world(
-  on: On,
-  opts: { env?: Record<string, string>; cache?: { read: number; write: number }; limits?: { kind: string; percentUsed: number }[]; settings?: Record<string, unknown>; window?: number } = {},
-): World {
-  const w = { toasts: [] as string[], status: [] as (string | undefined)[], logs: [] as string[], ticks: 0 } as World
-  const cache = opts.cache ?? { read: 80_000, write: 1_000 }
-  // every tick writes the band's `tick` value: counting the writes counts the timer's work
-  on('state.set', { plugin: 'cache-countdown', key: 'tick' }, ($, e, next) => {
-    w.ticks += 1
-    return next(e)
+describe('formatting', () => {
+  test('counts and clocks', () => {
+    expect(formatCount(84_200)).toBe('84.2k')
+    expect(formatCount(300)).toBe('300')
+    expect(formatCount(100_000)).toBe('100k')
+    expect(formatClock(200_000)).toBe('3:20')
+    expect(formatClock(3_600_000)).toBe('1:00:00')
   })
-  w.clock = mock.clock(on, { now: T0 })
-  mock.env(on, opts.env ?? {})
-  mock.store(on, { setupSeen: true })
-  on('session.usage', () => ({ value: { startedAt: 0, context: opts.window ? { window: opts.window } : {}, rateLimits: opts.limits ?? [] } }) as never)
-  on('settings.read', () => ({ value: opts.settings ?? {} }) as never)
-  on('session.start', async ($, e) => ({ cwd: e.cwd }) as never)
-  on('session.end', async () => ({ sessionId: 's1' }) as never)
-  on('command.register', () => ({ value: undefined }) as never)
-  on('ui.open', () => ({ value: {} }) as never)
-  on('ui.close', () => ({ value: undefined }) as never)
-  on('ui.toast', ($, e) => {
-    w.toasts.push(String((e as { text: unknown }).text))
-    return { value: undefined } as never
-  })
-  on('ui.log', ($, e) => {
-    w.logs.push(String((e as { text: unknown }).text))
-    return { value: undefined } as never
-  })
-  on('ui.status', ($, e) => {
-    w.status.push((e as { text?: string }).text)
-    return { value: undefined } as never
-  })
-  // the engine's own drawing when the mod passes (band hidden): nothing
-  on('ui.render', ($, e) => {
-    const { Box } = $.ui.resolve(e)
-    return <Box key="engine" />
-  })
-  on('turn.step', async function* ($, e) {
-    return {
-      turnId: e.turnId,
-      index: e.index,
-      answer: '',
-      toolUses: [],
-      stopReason: 'end_turn',
-      usage: { model: 'claude-sonnet-5-5', input_tokens: 300, output_tokens: 50, cache_read_input_tokens: cache.read, cache_creation_input_tokens: cache.write },
-    } as never
-  })
-  return w
-}
 
-const start = ($: Engine) => $.session.start({ cwd: '/tmp/x', surface: 'terminal', isInteractive: true } as never)
+  test('the stacked bar fills its cells and shows every part', () => {
+    const parts = splitCells([80_000, 1_000, 300], 40)
+    expect(parts.reduce((a, b) => a + b, 0)).toBe(40)
+    for (const n of parts) expect(n).toBeGreaterThanOrEqual(1)
+    expect(splitCells([0, 0, 0], 10)).toEqual([0, 0, 0])
+  })
 
-async function step($: Engine, over: { turnId?: string; index?: number; agentId?: string } = {}) {
-  const stream = $.turn.step({ turnId: 't1', index: 0, model: 'claude-sonnet-5-5', messageCount: 3, ...over } as never)
-  for (;;) {
-    const n = await stream.next()
-    if (n.done) return n.value
-  }
-}
+  test('per-turn rows and totals add up', () => {
+    const v = viewOf([
+      sample(0, 0, 50_000, 300, 'opus', 'a', 1),
+      sample(10_000, 50_000, 2_000, 200, 'opus', 'a', 1),
+      sample(MIN, 52_000, 1_000, 100, 'opus', 'b', 2),
+    ])
+    expect(v.rows.map(r => [r.label, r.steps])).toEqual([['1', 2], ['2', 1]])
+    expect(v.total).toMatchObject({ label: 'all', steps: 3 })
+    expect(v.rows.reduce((a, r) => a + r.read, 0)).toBe(v.total.read)
+    expect(v.rows.reduce((a, r) => a + r.write, 0)).toBe(v.total.write)
+    expect(v.rows.reduce((a, r) => a + r.fresh, 0)).toBe(v.total.fresh)
+    expect(viewOf([sample(0, 1, 1)], HOUR).ttlLabel).toBe('1h')
+  })
+})
 
-const band = ($: Engine) =>
-  $.ui.mount({ plugin: 'cache-countdown', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 120 } as never })
+// ---------------------------------------------------------------- the module
 
 describe('band', () => {
-  test('nothing before the first request; then hit %, read/wrote/new and the countdown', async ($, on) => {
-    world(on)
-    await start($)
-    const empty = await band($)
-    expect(await empty.find({ type: 'Text', text: /cache/ })).toBeUndefined()
-    await empty.unmount()
+  for (const surface of SURFACES) {
+    test(`${surface}: empty before the first request, then the meter`, async ($, on) => {
+      const w = world(on)
+      await start($)
+      const b = await band($, surface)
+      expect(await b.find({ type: 'Text', text: /cache/ })).toBeUndefined()
+      await request($, w, TYPICAL)
+      expect(await b.find({ type: 'Text', text: '98%' })).toBeDefined()
+      expect(await b.find({ type: 'Text', text: 'read 80k' })).toBeDefined()
+      expect(await b.find({ type: 'Text', text: 'wrote 1k' })).toBeDefined()
+      expect(await b.find({ type: 'Text', text: 'new 300' })).toBeDefined()
+      expect(await b.find({ type: 'Text', text: '⏱ 5m' })).toBeDefined()
+      expect(await b.find({ type: 'Text', text: '5m · warm' })).toBeDefined()
+      await b.unmount()
+    })
+  }
 
-    await step($)
-    const ui = await band($)
-    expect(await ui.find({ type: 'Text', text: /^98%$/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /read 80k/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /wrote 1k/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /new 300/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /⏱ 5m/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /5m · warm/ })).toBeDefined()
-    await ui.unmount()
-  })
-
-  test('a subagent request leaves the meter alone', async ($, on) => {
+  test('narrow band shows the prompt size instead of the three counts', async ($, on) => {
     const w = world(on)
     await start($)
-    await step($, { agentId: 'agent-1' })
-    expect(w.logs.some(l => l.includes('step read='))).toBe(false)
-    await step($)
-    expect(w.logs.filter(l => l.includes('step read=')).length).toBe(1)
+    const b = await band($, 'terminal', 70)
+    await request($, w, TYPICAL)
+    expect(await b.find({ type: 'Text', text: 'prompt 81.3k' })).toBeDefined()
+    expect(await b.find({ type: 'Text', text: 'read 80k' })).toBeUndefined()
+    await b.unmount()
   })
 
-  test('countdown runs, toasts at 60/10/3/1s, then the timer STOPS once expired', async ($, on) => {
+  test('a subagent request records nothing; a main request logs once', async ($, on) => {
     const w = world(on)
     await start($)
-    await step($)
-    await w.clock.advance(250_000)
-    const mid = await band($)
-    expect(await mid.find({ type: 'Text', text: /⏱ 0:50/ })).toBeDefined()
-    expect(await mid.find({ type: 'Text', text: /expires soon/ })).toBeDefined()
-    await mid.unmount()
-    await w.clock.advance(51_000)
-    expect(w.toasts.length).toBe(4)
-    expect(w.toasts[0]).toContain('expires in 1 min')
-    expect(w.toasts[3]).toContain('1s')
-    const done = await band($)
-    expect(await done.find({ type: 'Text', text: /expired/ })).toBeDefined()
-    await done.unmount()
-    // idle and expired: no timer, so ten more minutes cost zero ticks
-    const before = w.ticks
-    await w.clock.advance(600_000)
-    expect(w.ticks).toBe(before)
+    await request($, w, { ...TYPICAL, agentId: 'agent-1' })
+    expect(w.logs.filter(l => l.includes('step read='))).toHaveLength(0)
+    await request($, w, TYPICAL)
+    expect(w.logs.filter(l => l.includes('step read='))).toHaveLength(1)
+    expect(w.logs.find(l => l.includes('step read='))).toContain('read=80000')
   })
 
+  test('/clear empties the band', async ($, on) => {
+    const w = world(on)
+    await start($)
+    const b = await band($)
+    await request($, w, TYPICAL)
+    expect(await b.find({ type: 'Text', text: 'read 80k' })).toBeDefined()
+    await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } } as never)
+    expect(await b.find({ type: 'Text', text: /read|cache/ })).toBeUndefined()
+    await b.unmount()
+  })
 
-  test('DISABLE_PROMPT_CACHING says off and runs no countdown', async ($, on) => {
+  test('caching off: says so, no countdown, no wakes', async ($, on) => {
     const w = world(on, { env: { DISABLE_PROMPT_CACHING: '1' } })
     await start($)
-    await step($)
-    const ui = await band($)
-    expect(await ui.find({ type: 'Text', text: /prompt caching is off/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /⏱/ })).toBeUndefined()
-    await ui.unmount()
-    const before = w.ticks
-    await w.clock.advance(60_000)
-    expect(w.ticks).toBe(before)
+    const b = await band($)
+    expect(await b.find({ type: 'Text', text: /prompt caching is off/ })).toBeDefined()
+    await request($, w, TYPICAL)
+    expect(await b.find({ type: 'Text', text: /prompt caching is off/ })).toBeDefined()
+    expect(await b.find({ type: 'Text', text: /⏱/ })).toBeUndefined()
+    await w.clock.advance(10 * MIN)
+    expect(w.ticks).toBe(0)
+    await b.unmount()
   })
 })
 
-describe('surfaces', () => {
-  for (const surface of ['terminal', 'desktop'] as const) {
-    test(`band and pane draw on ${surface}`, async ($, on) => {
-      world(on)
+describe('countdown', () => {
+  test('5m with marks 60,10,3,1: soon, four toasts, expired, then no wakes', { options: { toastAt: '60,10,3,1' } }, async ($, on) => {
+    const w = world(on)
+    await start($)
+    const b = await band($)
+    await request($, w, TYPICAL)
+    expect(await b.find({ type: 'Text', text: '⏱ 5m' })).toBeDefined()
+    await w.clock.advance(250_000)
+    expect(await b.find({ type: 'Text', text: '⏱ 0:50' })).toBeDefined()
+    expect(await b.find({ type: 'Text', text: /expires soon/ })).toBeDefined()
+    await w.clock.advance(50_000)
+    const toasts = cacheToasts(w)
+    expect(toasts).toHaveLength(4)
+    expect(toasts[0]).toContain('expires in 1 min')
+    expect(toasts[0]).toContain('keep 81.3k warm')
+    expect(toasts[3]).toContain('1s')
+    expect(toasts[3]).toContain('send a message now')
+    expect(await b.find({ type: 'Text', text: /expired/ })).toBeDefined()
+    const wakes = w.ticks
+    await w.clock.advance(30 * MIN)
+    expect(w.ticks).toBe(wakes)
+    expect(cacheToasts(w)).toHaveLength(4)
+    await b.unmount()
+  })
+
+  test('1h on defaults: about two wakes a minute-step hour', { options: {}, timeoutMs: 60_000 }, async ($, on) => {
+    const w = world(on, { limits: [{ kind: 'five_hour', percentUsed: 20 }] })
+    await start($)
+    await request($, w, TYPICAL)
+    await w.clock.advance(61 * MIN)
+    expect(w.ticks).toBeGreaterThanOrEqual(100)
+    expect(w.ticks).toBeLessThanOrEqual(130)
+  })
+
+  test('1h with tickSeconds 10', { options: { tickSeconds: 10 }, timeoutMs: 60_000 }, async ($, on) => {
+    const w = world(on, { limits: [{ kind: 'five_hour', percentUsed: 20 }] })
+    await start($)
+    await request($, w, TYPICAL)
+    await w.clock.advance(61 * MIN)
+    expect(w.ticks).toBeGreaterThanOrEqual(400)
+    expect(w.ticks).toBeLessThanOrEqual(430)
+  })
+
+  test('toastAt 30,5: two toasts, 30s then 5s', { options: { toastAt: '30,5' } }, async ($, on) => {
+    const w = world(on)
+    await start($)
+    await request($, w, TYPICAL)
+    await w.clock.advance(6 * MIN)
+    const toasts = cacheToasts(w)
+    expect(toasts).toHaveLength(2)
+    expect(toasts[0]).toContain('30s')
+    expect(toasts[1]).toContain('5s')
+  })
+
+  test('1h with marks 30m,15m,5m,1m', { options: { ttl: '1h', toastAt: '30m,15m,5m,1m' }, timeoutMs: 30_000 }, async ($, on) => {
+    const w = world(on)
+    await start($)
+    await request($, w, TYPICAL)
+    await w.clock.advance(61 * MIN)
+    const toasts = cacheToasts(w)
+    expect(toasts).toHaveLength(4)
+    expect(toasts[0]).toStartWith('cache expires in 30 min')
+    expect(toasts[1]).toContain('15 min')
+    expect(toasts[2]).toContain('5 min')
+    expect(toasts[3]).toContain('1 min')
+  })
+
+  test('a new request re-arms the marks', { options: { toastAt: '10s' } }, async ($, on) => {
+    const w = world(on)
+    await start($)
+    await request($, w, TYPICAL)
+    await w.clock.advance(295_000)
+    expect(cacheToasts(w)).toHaveLength(1)
+    await request($, w, TYPICAL)
+    await w.clock.advance(295_000)
+    expect(cacheToasts(w)).toHaveLength(2)
+  })
+})
+
+describe('context window alerts', () => {
+  test('one toast for the lowest level crossed, not repeated', async ($, on) => {
+    const w = world(on, { window: 100_000 })
+    await start($)
+    await request($, w, TYPICAL)
+    expect(contextToasts(w)).toEqual(['context: 19% of window remaining (81.3k of 100k used) · /compact or /clear frees room'])
+    await request($, w, { read: 81_000, write: 400, fresh: 200 })
+    expect(contextToasts(w)).toHaveLength(1)
+  })
+
+  test('a 1M window crosses nothing; the cache toast still fires once', { options: { toastAt: '10s' } }, async ($, on) => {
+    const w = world(on, { window: 1_000_000 })
+    await start($)
+    await request($, w, TYPICAL)
+    await w.clock.advance(6 * MIN)
+    expect(contextToasts(w)).toHaveLength(0)
+    expect(cacheToasts(w)).toHaveLength(1)
+  })
+
+  test('contextAlertsAt off: none', { options: { contextAlertsAt: 'off' } }, async ($, on) => {
+    const w = world(on, { window: 100_000 })
+    await start($)
+    await request($, w, TYPICAL)
+    expect(contextToasts(w)).toHaveLength(0)
+  })
+
+  for (const [window, fragment] of [
+    [1_000_000, '92% of window remaining), keep going'],
+    [120_000, '32% of window remaining). /compact first'],
+  ] as const) {
+    test(`expired advice on a ${window} window`, async ($, on) => {
+      const w = world(on, { window })
       await start($)
-      await step($)
-      const b = await $.ui.mount({ plugin: 'cache-countdown', surface, component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 120 } as never })
-      expect(await b.find({ type: 'Text', text: /read 80k/ })).toBeDefined()
+      const b = await band($)
+      await request($, w, TYPICAL)
+      await w.clock.advance(5 * MIN)
+      expect(await b.find({ type: 'Text', text: fragment })).toBeDefined()
       await b.unmount()
-      await $.command.run({ command: 'cache', args: '' } as never)
-      const p = await $.ui.mount({ plugin: 'cache-countdown', surface, component: 'Pane', requestId: 'cache', props: { title: 'cache', isFocused: true, bodyColumns: 60, placement: 'dock' } as never } as never)
-      expect(await p.find({ type: 'Text', text: /PROMPT CACHE|PROMPT CACHE/ })).toBeDefined()
-      await p.unmount()
     })
   }
 })
 
-describe('pace and toasts are configurable', () => {
-  test('1h cache on defaults: ~120 wakes in an hour (once a minute, then per second in the last minute)', { options: { ttl: '1h' } }, async ($, on) => {
+describe('lifetime sources at load', () => {
+  const cases = [
+    ['subscription', {}, { limits: [{ kind: 'five_hour', percentUsed: 20 }] }, '1h cache (Claude subscription default)'],
+    ['env var', {}, { env: { CLAUDE_CODE_PROMPT_CACHE_TTL: '5m' }, limits: [{ kind: 'five_hour', percentUsed: 20 }] }, '5m cache (CLAUDE_CODE_PROMPT_CACHE_TTL)'],
+    ['setting', {}, { settings: { promptCacheTtl: '1h' } }, '1h cache (promptCacheTtl setting)'],
+    ['option', { ttl: '5m' }, { limits: [{ kind: 'five_hour', percentUsed: 20 }] }, '5m cache (ttl option)'],
+  ] as const
+  for (const [name, options, worldOptions, line] of cases) {
+    test(name, { options }, async ($, on) => {
+      const w = world(on, worldOptions as WorldOptions)
+      await start($)
+      expect(w.logs.find(l => l.startsWith('cache-countdown loaded:'))).toContain(line)
+    })
+  }
+})
+
+describe('/cache', () => {
+  for (const surface of SURFACES) {
+    test(`${surface}: the pane, and the band steps aside while it is open`, async ($, on) => {
+      const w = world(on)
+      await start($)
+      const b = await band($, surface)
+      await request($, w, TYPICAL)
+      const r = await $.command.run({ command: 'cache', args: '' } as never)
+      expect((r as { text: string }).text).toContain('5m cache')
+      expect((r as { text: string }).text).toContain('/cache stop closes')
+      const p = await pane($, surface)
+      expect(await p.find({ type: 'Text', text: 'PROMPT CACHE' })).toBeDefined()
+      expect(await p.find({ type: 'Text', text: '⏱ 5m left' })).toBeDefined()
+      expect(await p.find({ type: 'Text', text: '98% hit' })).toBeDefined()
+      expect(await p.find({ type: 'Text', text: /^all$/ })).toBeDefined()
+      expect(await p.find({ type: 'Button', key: 'close' })).toBeDefined()
+      expect(await b.find({ type: 'Text', text: 'read 80k' })).toBeUndefined()
+      await p.press({ key: 'close' })
+      await p.unmount()
+      expect(await b.find({ type: 'Text', text: 'read 80k' })).toBeDefined()
+      await b.unmount()
+    })
+  }
+
+  test('/cache stop closes the pane', async ($, on) => {
     const w = world(on)
     await start($)
-    await step($)
-    await w.clock.advance(3_600_000)
-    expect(w.ticks).toBeGreaterThan(100)
-    expect(w.ticks).toBeLessThan(130)
+    const b = await band($)
+    await request($, w, TYPICAL)
+    await $.command.run({ command: 'cache', args: '' } as never)
+    expect(await b.find({ type: 'Text', text: 'read 80k' })).toBeUndefined()
+    const r = await $.command.run({ command: 'cache', args: 'stop' } as never)
+    expect((r as { text: string }).text).toContain('cache pane closed')
+    expect(await b.find({ type: 'Text', text: 'read 80k' })).toBeDefined()
+    await b.unmount()
   })
 
-  test('tickSeconds 10 ticks six times as often outside the final stretch', { options: { ttl: '1h', tickSeconds: 10 } }, async ($, on) => {
-    const w = world(on)
+  test('the footer line, when on', { options: { status: true } }, async ($, on) => {
+    const w = world(on, { limits: [{ kind: 'five_hour', percentUsed: 20 }] })
     await start($)
-    await step($)
-    await w.clock.advance(3_600_000)
-    expect(w.ticks).toBeGreaterThan(400)
-    expect(w.ticks).toBeLessThan(430)
+    await request($, w, TYPICAL)
+    expect(w.statuses.at(-1)).toBe('cache 98% · 60m')
+    await w.clock.advance(61 * MIN)
+    expect(w.statuses.at(-1)).toBe('cache 98% · expired')
+    await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } } as never)
+    expect(w.statuses.at(-1)).toBeUndefined()
   })
 
-  test('toastAt picks the marks', { options: { toastAt: '30,5' } }, async ($, on) => {
-    const w = world(on)
+  test('first load ever: one toast pointing at /cache setup', async ($, on) => {
+    const w = world(on, { store: {} })
     await start($)
-    await step($)
-    await w.clock.advance(301_000)
-    expect(w.toasts.length).toBe(2)
-    expect(w.toasts[0]).toContain('30s')
-    expect(w.toasts[1]).toContain('5s')
-  })
-
-  test('context alerts: one toast as the window crosses levels, not repeated', async ($, on) => {
-    // 81.3k of a 100k window: 19% remaining, past 50% and 25% at once, so one toast for 25%
-    const w = world(on, { window: 100_000 })
     await start($)
-    await step($)
-    await step($, { index: 1 })
-    const alerts = w.toasts.filter(t => t.startsWith('context:'))
-    expect(alerts).toEqual(['context: 19% of window remaining (81.3k of 100k used) · /compact or /clear frees room'])
-  })
-
-  test('context alerts stay quiet with plenty of room, and are independent of cache toasts', { options: { toastAt: '10s' } }, async ($, on) => {
-    const w = world(on, { window: 1_000_000 })
-    await start($)
-    await step($)
-    await w.clock.advance(301_000)
-    expect(w.toasts.filter(t => t.startsWith('context:'))).toEqual([])
-    expect(w.toasts.filter(t => t.startsWith('cache expires')).length).toBe(1)
-  })
-
-  test('contextAlertsAt off disables them', { options: { contextAlertsAt: 'off' } }, async ($, on) => {
-    const w = world(on, { window: 100_000 })
-    await start($)
-    await step($)
-    expect(w.toasts.filter(t => t.startsWith('context:'))).toEqual([])
-  })
-
-  test('/compact advice follows window remaining, and says how much is left', async ($, on) => {
-    const w = world(on, { window: 1_000_000 })
-    await start($)
-    await step($)
-    await w.clock.advance(301_000)
-    const ui = await band($)
-    expect(await ui.find({ type: 'Text', text: /92% of window remaining\), keep going/ })).toBeDefined()
-    await ui.unmount()
-  })
-
-  test('on a 120k window the same context (32% remaining) suggests /compact', async ($, on) => {
-    const w = world(on, { window: 120_000 })
-    await start($)
-    await step($)
-    await w.clock.advance(301_000)
-    const ui = await band($)
-    expect(await ui.find({ type: 'Text', text: /32% of window remaining\)\. \/compact first/ })).toBeDefined()
-    await ui.unmount()
+    expect(w.toasts.filter(t => t.includes('/cache setup'))).toHaveLength(1)
   })
 })
 
-describe('toasts in minutes', () => {
-  test('30m,15m,5m,1m on a 1h cache: four toasts worded in minutes', { options: { ttl: '1h', toastAt: '30m,15m,5m,1m' } }, async ($, on) => {
-    const w = world(on)
-    await start($)
-    await step($)
-    await w.clock.advance(3_601_000)
-    expect(w.toasts).toEqual([
-      'cache expires in 30 min: send a message to keep 81.3k tokens warm',
-      'cache expires in 15 min: send a message to keep 81.3k tokens warm',
-      'cache expires in 5 min: send a message to keep 81.3k tokens warm',
-      'cache expires in 1 min: send a message to keep 81.3k tokens warm',
-    ])
-  })
-})
+// ---------------------------------------------------------------- the walkthrough (adapted from the kept tests)
 
 describe('setup walkthrough', () => {
   test('pure: draft from options, toast row, changes', () => {
@@ -495,64 +689,5 @@ describe('setup walkthrough', () => {
     await pane.press({ key: 'save' })
     await pane.unmount()
     expect(w.toasts.at(-1)).toContain('status not saved (locked by managed settings)')
-  })
-})
-
-describe('ttl sources', () => {
-  test('a Claude subscription defaults to 1h', async ($, on) => {
-    const w = world(on, { limits: [{ kind: 'five_hour', percentUsed: 12 }] })
-    await start($)
-    expect(w.logs.join('\n')).toContain('1h cache (Claude subscription default)')
-  })
-  test('CLAUDE_CODE_PROMPT_CACHE_TTL beats the subscription default', async ($, on) => {
-    const w = world(on, { env: { CLAUDE_CODE_PROMPT_CACHE_TTL: '5m' }, limits: [{ kind: 'five_hour', percentUsed: 12 }] })
-    await start($)
-    expect(w.logs.join('\n')).toContain('5m cache (CLAUDE_CODE_PROMPT_CACHE_TTL)')
-  })
-  test('the promptCacheTtl setting (merged, managed included) is read', async ($, on) => {
-    const w = world(on, { settings: { promptCacheTtl: '1h' } })
-    await start($)
-    expect(w.logs.join('\n')).toContain('1h cache (promptCacheTtl setting)')
-  })
-  test('the ttl option pins it', { options: { ttl: '5m' } }, async ($, on) => {
-    const w = world(on, { env: { ENABLE_PROMPT_CACHING_1H: '1' } })
-    await start($)
-    expect(w.logs.join('\n')).toContain('5m cache (ttl option)')
-  })
-})
-
-describe('/cache pane', () => {
-  test('opens with countdown, last-request bar and per-turn table; the band steps aside', async ($, on) => {
-    world(on)
-    await start($)
-    await step($, { turnId: 'a' })
-    await step($, { turnId: 'a', index: 1 })
-    await step($, { turnId: 'b' })
-    const r = await $.command.run({ command: 'cache', args: '' } as never)
-    expect((r as { text: string }).text).toContain('5m cache')
-    const pane = await $.ui.mount({ plugin: 'cache-countdown', surface: 'terminal', component: 'Pane', requestId: 'cache', props: { title: 'cache', isFocused: true, bodyColumns: 60, placement: 'dock' } as never } as never)
-    expect(await pane.find({ type: 'Text', text: /PROMPT CACHE/ })).toBeDefined()
-    expect(await pane.find({ type: 'Text', text: /⏱ 5m left/ })).toBeDefined()
-    expect(await pane.find({ type: 'Text', text: /98% hit/ })).toBeDefined()
-    expect(await pane.find({ type: 'Text', text: /^all$/ })).toBeDefined()
-    expect(await pane.find({ type: 'Button', key: 'close' })).toBeDefined()
-    await pane.unmount()
-    const b = await band($)
-    expect(await b.find({ type: 'Text', text: /cache/ })).toBeUndefined()
-    await b.unmount()
-    await $.command.run({ command: 'cache', args: 'stop' } as never)
-    const back = await band($)
-    expect(await back.find({ type: 'Text', text: /read 80k/ })).toBeDefined()
-    await back.unmount()
-  })
-
-  test('/clear starts the meter over', async ($, on) => {
-    world(on)
-    await start($)
-    await step($)
-    await $.session.end({ reason: 'clear', sessionId: 's1' } as never)
-    const ui = await band($)
-    expect(await ui.find({ type: 'Text', text: /cache/ })).toBeUndefined()
-    await ui.unmount()
   })
 })

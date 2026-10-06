@@ -44,6 +44,7 @@ There is no fixed interval. One timer sleeps until the next moment something cha
 | the last `warnSeconds` (default 60) | `0:42` | every `finalTickSeconds` (default 1) |
 | a toast mark | | once, at the mark |
 | expired, nothing cached, caching off | `0:00` | never, until your next request |
+| meter row, footer line and toasts all off, `/cache` closed | | never: nothing to draw or announce |
 
 On a 1-hour cache with the defaults that's about 120 wakes per hour instead of 3,600. Each wake redraws only the band and the pane, which takes about 1–5 ms per redraw (measured in a live session).
 

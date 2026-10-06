@@ -168,9 +168,9 @@ export const DEFAULTS: SetupDraft = {
   status: false,
 }
 
-export type PresetKey = 'recommended' | 'quiet' | 'live'
+export type PresetName = 'recommended' | 'quiet' | 'live'
 
-export const PRESETS: { key: PresetKey; label: string; about: string; draft: SetupDraft }[] = [
+export const PRESETS: { key: PresetName; label: string; about: string; draft: SetupDraft }[] = [
   { key: 'recommended', label: 'Recommended', about: 'minute steps, 4 cache toasts, context alerts at 50/25/10%', draft: DEFAULTS },
   {
     key: 'quiet',
