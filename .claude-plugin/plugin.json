@@ -1,6 +1,7 @@
 {
   "name": "cache-countdown",
-  "version": "0.2.3",
+  "displayName": "Cache Countdown",
+  "version": "0.2.4",
   "description": "Prompt-cache meter above the input box: hit %, read/wrote/new tokens, a TTL countdown and advice; cache-expiry toasts and context-window alerts. /cache opens a detail pane; /cache setup walks through every setting.",
   "types": "./types/index.d.ts",
   "author": {
@@ -83,5 +84,8 @@
     }
   },
   "homepage": "https://github.com/jmac122/cache-countdown",
-  "repository": "https://github.com/jmac122/cache-countdown"
+  "repository": "https://github.com/jmac122/cache-countdown",
+  "icon": "./icon.png",
+  "documentationUrl": "https://github.com/jmac122/cache-countdown#readme",
+  "supportUrl": "https://github.com/jmac122/cache-countdown/issues"
 }

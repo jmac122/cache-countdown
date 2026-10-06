@@ -2,3 +2,6 @@
 .claude-plugin/types/
 tsconfig.json
 node_modules/
+.specstory/
+.remember/
+.playwright-mcp/
