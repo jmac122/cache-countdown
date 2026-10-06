@@ -117,8 +117,8 @@ export function advise(last: Sample | undefined, prev: Sample | undefined, polic
   if (left <= 0) {
     const left = policy.windowTokens ? ` (${remainingPct(size, policy.windowTokens)}% of window remaining)` : ''
     return size >= policy.compactAtTokens
-      ? { kind: 'expired', text: `expired: next message rewrites ${fmtTokens(size)} tokens${left}. /compact first, or /clear if done` }
-      : { kind: 'expired', text: `expired: ${fmtTokens(size)} tokens to rebuild${left}, keep going` }
+      ? { kind: 'expired', text: `expired: next message rewrites ${fmtCount(size)} tokens${left}. /compact first, or /clear if done` }
+      : { kind: 'expired', text: `expired: ${fmtCount(size)} tokens to rebuild${left}, keep going` }
   }
   if (left <= policy.warnMs) return { kind: 'soon', text: 'expires soon: any message refreshes it for free' }
   const miss = missReason(prev, last, policy.ttl)
@@ -126,7 +126,7 @@ export function advise(last: Sample | undefined, prev: Sample | undefined, polic
   return { kind: 'warm', text: 'warm: keep going' }
 }
 
-export function fmtTokens(n: number): string {
+export function fmtCount(n: number): string {
   if (n < 1000) return String(n)
   if (n < 100_000) return `${(n / 1000).toFixed(1).replace(/\.0$/, '')}k`
   if (n < 1_000_000) return `${Math.round(n / 1000)}k`

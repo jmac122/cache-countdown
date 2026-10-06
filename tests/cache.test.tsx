@@ -12,7 +12,7 @@ import {
   parseMarks,
   parseSpan,
   fmtSpan,
-  fmtTokens,
+  fmtCount,
   missReason,
   nextToastMark,
   observeTtl,
@@ -131,7 +131,7 @@ describe('pure logic', () => {
   test('formatting, segments, totals', () => {
     expect(fmtClock(200_000)).toBe('3:20')
     expect(fmtClock(3_600_000)).toBe('1:00:00')
-    expect(fmtTokens(84_200)).toBe('84.2k')
+    expect(fmtCount(84_200)).toBe('84.2k')
     const seg = segments(113_000, 4_000, 2, 40)
     expect(seg[0] + seg[1] + seg[2]).toBe(40)
     expect(seg[2]).toBeGreaterThanOrEqual(1)

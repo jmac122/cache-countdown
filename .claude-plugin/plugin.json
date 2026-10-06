@@ -1,7 +1,7 @@
 {
   "name": "cache-countdown",
   "displayName": "Cache Countdown",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Prompt-cache meter above the input box: hit %, read/wrote/new tokens, a TTL countdown and advice; cache-expiry toasts and context-window alerts. /cache opens a detail pane; /cache setup walks through every setting.",
   "types": "./types/index.d.ts",
   "author": {
@@ -20,13 +20,8 @@
     "ttl": {
       "type": "string",
       "title": "Cache lifetime",
-      "description": "auto follows Claude Code's rules (FORCE_PROMPT_CACHING_5M, CLAUDE_CODE_PROMPT_CACHE_TTL, promptCacheTtl setting, ENABLE_PROMPT_CACHING_1H, then 1h on a Claude subscription / 5m otherwise) and corrects itself from request timing; 5m or 1h pins it",
-      "default": "auto",
-      "options": [
-        "auto",
-        "5m",
-        "1h"
-      ]
+      "description": "auto follows Claude Code's rules (FORCE_PROMPT_CACHING_5M, CLAUDE_CODE_PROMPT_CACHE_TTL, promptCacheTtl setting, ENABLE_PROMPT_CACHING_1H, then 1h on a Claude subscription / 5m otherwise) and corrects itself from request timing; 5m or 1h pins it; any other value means auto",
+      "default": "auto"
     },
     "warnSeconds": {
       "type": "number",

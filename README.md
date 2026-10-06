@@ -88,14 +88,21 @@ It reads:
 
 It writes:
 
-- Its own options under `pluginConfigs` in your Claude Code user settings, and only when you press Save in `/cache setup`. It does not touch permissions, hooks, your statusline or any other setting.
+- Its own options, through `$.config.set`, only when you press Save in `/cache setup`, and only the ones you changed. They land under `pluginConfigs` in your Claude Code user settings, the same place `/config` puts them. The complete list of keys it can write is `cache-countdown.ttl`, `.tickSeconds`, `.warnSeconds`, `.finalTickSeconds`, `.toast`, `.toastAt`, `.contextAlertsAt`, `.compactWhenRemainingPct`, `.band` and `.status`. Each is spelled out in `hooks/cache-countdown.tsx` (`writeSetting`). It never sets environment variables, the permission mode, permissions, hooks, your statusline or any other setting.
 - One flag, `setupSeen`, in the plugin's own store, so the first-run hint shows only once.
 
 Request history lives in session memory (`$.state`) and is gone when the session ends. There is no telemetry, no account and no remote server, so there is no privacy policy.
 
 ## What it hooks
 
-`session.start`, `session.end` (`/clear` resets the meter), `turn.step` (main loop only; subagents have their own prefixes), `command.run` (`/cache`), `ui.close`, and `ui.render` (`AbovePrompt` and two `Pane`s). Request history lives in `$.state`, so a hot reload keeps it.
+- `session.start`: reads the settings and env vars above, registers `/cache`.
+- `session.end`: on `/clear`, resets the meter.
+- `turn.step`: records each main-loop request's token counts (subagents are skipped; they have their own cache prefixes). It passes every request through unchanged.
+- `command.run`: answers `/cache`, `/cache setup` and `/cache stop`. Every other command passes straight through untouched; it never sees, changes or blocks them.
+- `ui.close`: notices when its own pane closes.
+- `ui.render`: draws the meter row (`AbovePrompt`) and its two panes; everything else is passed through.
+
+It changes nothing about requests, prompts, tools or other commands. Request history lives in `$.state`, so a hot reload keeps it.
 
 ## Develop
 
