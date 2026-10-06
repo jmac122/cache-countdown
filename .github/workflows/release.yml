@@ -8,8 +8,8 @@ name: check and release
 # v* tag. Bumping the version is the release trigger: Claude Code only updates an install when the
 # version changes, so a push without a bump ships nothing and gets no release.
 #
-# Values move between steps through files and step outputs, not command substitution, so every
-# command here is written out in full.
+# The logic runs as plain JavaScript in actions/github-script: no shell, no variables expanded into
+# commands. Git is called with fixed argument lists.
 
 on:
   push:
@@ -31,14 +31,19 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: '22'
+      - name: Versions agree
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs')
+            const plugin = JSON.parse(fs.readFileSync('.claude-plugin/plugin.json', 'utf8'))
+            const market = JSON.parse(fs.readFileSync('.claude-plugin/marketplace.json', 'utf8'))
+            const entry = market.plugins.find(p => p.name === 'cache-countdown')
+            if (!entry || entry.version !== plugin.version) {
+              core.setFailed('plugin.json is ' + plugin.version + ' but marketplace.json is ' + (entry ? entry.version : 'missing'))
+            }
       - name: Install Claude Code
         run: npm install -g @anthropic-ai/claude-code
-      - name: Versions agree
-        run: >-
-          jq -e -n
-          --slurpfile p .claude-plugin/plugin.json
-          --slurpfile m .claude-plugin/marketplace.json
-          '$p[0].version == ($m[0].plugins[] | select(.name == "cache-countdown") | .version)'
       - name: Validate
         run: claude plugin validate --strict .
       - name: Test
@@ -50,7 +55,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # the tag and the GitHub Release, both through GH_TOKEN
+      contents: write   # the tag and the GitHub Release
     steps:
       # fetch-depth: 0 + fetch-tags: the notes are the commits since the previous v* tag.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -58,52 +63,56 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
           persist-credentials: false
-      - name: Read the version
-        id: version
-        run: jq -r '"tag=v" + .version' .claude-plugin/plugin.json >> "$GITHUB_OUTPUT"
-      - name: Is it new?
-        id: new
-        env:
-          TAG: ${{ steps.version.outputs.tag }}
-        run: |
-          if git rev-parse -q --verify "refs/tags/$TAG" > /dev/null; then
-            echo "$TAG is already tagged; no new version in this push"
-          else
-            echo "release=true" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Write the notes
-        if: steps.new.outputs.release == 'true'
-        env:
-          TAG: ${{ steps.version.outputs.tag }}
-          REPO: ${{ github.repository }}
-        run: |
-          git tag --list 'v*' --merged HEAD --sort=-v:refname | head -n 1 > prev.txt
-          read -r prev < prev.txt || prev=""
-          {
-            if [ -n "$prev" ]; then
-              echo "## Changes since $prev"
-              echo
-              git log --no-merges --pretty='- %s' "$prev..HEAD"
-              echo
-              echo "**Full changelog**: https://github.com/$REPO/compare/$prev...$TAG"
-            else
-              echo "## Changes"
-              echo
-              git log --no-merges --pretty='- %s'
-            fi
-            echo
-            echo "## Install"
-            echo
-            echo '```'
-            echo '/plugin marketplace add jmac122/cache-countdown'
-            echo '/plugin install cache-countdown@cache-countdown'
-            echo '```'
-          } > notes.md
-          cat notes.md
-      - name: Publish the release
-        if: steps.new.outputs.release == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.version.outputs.tag }}
-        # a re-run that finds the release already made counts as success
-        run: gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --notes-file notes.md --latest || gh release view "$TAG" > /dev/null
+      - name: Tag and release a new version
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs')
+            const { execFileSync } = require('child_process')
+            const git = args => execFileSync('git', args, { encoding: 'utf8' })
+
+            const tag = 'v' + JSON.parse(fs.readFileSync('.claude-plugin/plugin.json', 'utf8')).version
+            const tags = git(['tag', '--list', 'v*', '--merged', 'HEAD', '--sort=-v:refname']).split('\n').filter(Boolean)
+            if (tags.includes(tag)) {
+              core.info(tag + ' is already tagged; no new version in this push')
+              return
+            }
+
+            const prev = tags[0]
+            const changes = prev
+              ? git(['log', '--no-merges', '--pretty=- %s', prev + '..HEAD'])
+              : git(['log', '--no-merges', '--pretty=- %s'])
+            const repo = context.repo.owner + '/' + context.repo.repo
+            const fence = '`'.repeat(3)
+            const body = [
+              prev ? '## Changes since ' + prev : '## Changes',
+              '',
+              changes.trim(),
+              '',
+              prev ? '**Full changelog**: https://github.com/' + repo + '/compare/' + prev + '...' + tag : '',
+              '',
+              '## Install',
+              '',
+              fence,
+              '/plugin marketplace add jmac122/cache-countdown',
+              '/plugin install cache-countdown@cache-countdown',
+              fence,
+            ].join('\n')
+            core.info(body)
+
+            try {
+              await github.rest.repos.createRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_name: tag,
+                target_commitish: context.sha,
+                name: tag,
+                body,
+                make_latest: 'true',
+              })
+            } catch (err) {
+              // a re-run that finds the release already made counts as success
+              const existing = await github.rest.repos.getReleaseByTag({ owner: context.repo.owner, repo: context.repo.repo, tag }).catch(() => null)
+              if (!existing) throw err
+              core.info(tag + ' was released by another run; left as is')
+            }
