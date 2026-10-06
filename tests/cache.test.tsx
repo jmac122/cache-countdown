@@ -163,7 +163,7 @@ function world(
   on('session.end', async () => ({ sessionId: 's1' }) as never)
   on('command.register', () => ({ value: undefined }) as never)
   on('ui.open', () => ({ value: {} }) as never)
-  on('ui.close', () => undefined as never)
+  on('ui.close', () => ({ value: undefined }) as never)
   on('ui.toast', ($, e) => {
     w.toasts.push(String((e as { text: unknown }).text))
     return { value: undefined } as never
