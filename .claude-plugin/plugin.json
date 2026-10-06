@@ -1,7 +1,7 @@
 {
   "name": "cache-countdown",
   "displayName": "Cache Countdown",
-  "version": "0.2.4",
+  "version": "0.1.0",
   "description": "Prompt-cache meter above the input box: hit %, read/wrote/new tokens, a TTL countdown and advice; cache-expiry toasts and context-window alerts. /cache opens a detail pane; /cache setup walks through every setting.",
   "types": "./types/index.d.ts",
   "author": {
