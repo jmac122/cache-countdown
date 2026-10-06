@@ -113,7 +113,3 @@ tsc -p .
 ```
 
 `hooks/cache.ts` and `hooks/setup.ts` are pure logic with no engine calls. `hooks/cache-countdown.tsx` is the wiring.
-
-## Credits
-
-The TTL rules, advice and observed-TTL logic are adapted from [davila7/claude-code-templates](https://github.com/davila7/claude-code-templates) `mods/observability/prompt-cache-control` (MIT). See `LICENSE`.
