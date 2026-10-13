@@ -110,7 +110,10 @@ It changes nothing about requests, prompts, tools or other commands. Request his
 ```
 claude plugin validate .
 claude plugin test .
+claude --plugin-dir .   # once, in an interactive session
 tsc -p .
 ```
+
+`tsc -p .` needs the type declarations Claude Code writes beside the plugin when an interactive session loads it from this folder: `.claude-plugin/types/` and a `tsconfig.json` that extends it (both gitignored, rewritten on every load). A fresh clone has neither, so load it once with `claude --plugin-dir .` before type-checking. `claude -p` does not write them.
 
 `hooks/cache.ts` and `hooks/setup.ts` are pure logic with no engine calls. `hooks/cache-countdown.tsx` is the wiring.
