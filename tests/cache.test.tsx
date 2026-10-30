@@ -41,6 +41,8 @@ type WorldOptions = {
   limits?: { kind: string; percentUsed: number }[]
   settings?: Record<string, unknown>
   store?: Record<string, unknown>
+  /** a store key whose writes fail */
+  failStore?: string
 }
 
 type World = {
@@ -51,13 +53,27 @@ type World = {
   /** writes of the band/pane tick: one per wake that had someone to draw for */
   ticks: number
   usage: TurnUsage[]
+  /** each value written to the store under "options" (what /cache setup saved) */
+  saved: unknown[]
 }
 
 /** Everything beneath the plugin: each `$` call it makes is answered here. */
 function world(on: On, o: WorldOptions = {}): World {
-  const w: World = { clock: mock.clock(on, { now: T0 }), toasts: [], logs: [], statuses: [], ticks: 0, usage: [] }
+  const w: World = { clock: mock.clock(on, { now: T0 }), toasts: [], logs: [], statuses: [], ticks: 0, usage: [], saved: [] }
   mock.env(on, o.env ?? {})
-  mock.store(on, o.store ?? { setupSeen: true })
+  const store = new Map(Object.entries(o.store ?? { setupSeen: true }))
+  on('store.get', ($, e) => ({ value: store.get(e.key) }) as never)
+  on('store.set', ($, e) => {
+    if (e.key === o.failStore) throw new Error('write failed')
+    if (e.key === 'options') w.saved.push(e.value)
+    store.set(e.key, JSON.parse(JSON.stringify(e.value)))
+    return { value: undefined } as never
+  })
+  on('store.delete', ($, e) => {
+    store.delete(e.key)
+    return { value: undefined } as never
+  })
+  on('store.keys', () => ({ value: [...store.keys()] }) as never)
   on('ui.render', () => ({ type: 'Box', props: {}, children: [] }) as never)
   on('ui.toast', ($, e) => {
     w.toasts.push(e.text)
@@ -591,11 +607,6 @@ describe('setup walkthrough', () => {
   for (const surface of ['terminal', 'desktop'] as const) {
     test(surface + ': preset step, skip to review, Save writes only what changed', async ($, on) => {
       const w = world(on)
-      const written: { key: string; value: unknown }[] = []
-      on('config.set', ($, e) => {
-        written.push({ key: e.key, value: e.value })
-        return { value: e.value } as never
-      })
       await start($)
       const r = await $.command.run({ command: 'cache', args: 'setup' } as never)
       expect((r as { text: string }).text).toContain('setup opened')
@@ -608,12 +619,7 @@ describe('setup walkthrough', () => {
       expect(await pane.find({ type: 'Button', key: 'save', text: /Save 4 changes/ })).toBeDefined()
       await pane.press({ key: 'save' })
       await pane.unmount()
-      expect(written).toEqual([
-        { key: 'cache-countdown.tickSeconds', value: 1 },
-        { key: 'cache-countdown.toastAt', value: '5m,2m,1m' },
-        { key: 'cache-countdown.contextAlertsAt', value: '75,50,25,10,5' },
-        { key: 'cache-countdown.status', value: true },
-      ])
+      expect(w.saved).toEqual([{ tickSeconds: 1, toastAt: '5m,2m,1m', contextAlertsAt: '75,50,25,10,5', status: true }])
       expect(w.toasts.at(-1)).toContain('tickSeconds = 1')
     })
   }
@@ -634,12 +640,7 @@ describe('setup walkthrough', () => {
   })
 
   test('custom… opens a text field; what you type is cleaned and saved', async ($, on) => {
-    world(on)
-    const written: { key: string; value: unknown }[] = []
-    on('config.set', ($, e) => {
-      written.push({ key: e.key, value: e.value })
-      return { value: e.value } as never
-    })
+    const w = world(on)
     await start($)
     await $.command.run({ command: 'cache', args: 'setup' } as never)
     const pane = await $.ui.mount({ plugin: 'cache-countdown', surface: 'terminal', component: 'Pane', requestId: 'cache-setup', props: { title: 'cache setup', isFocused: true, bodyColumns: 80, placement: 'dock' } as never })
@@ -656,10 +657,7 @@ describe('setup walkthrough', () => {
     await pane.press({ key: 'review' })
     await pane.press({ key: 'save' })
     await pane.unmount()
-    expect(written).toEqual([
-      { key: 'cache-countdown.toastAt', value: '45m,20m,2m' },
-      { key: 'cache-countdown.contextAlertsAt', value: '75,50,25,10,5' },
-    ])
+    expect(w.saved).toEqual([{ toastAt: '45m,20m,2m', contextAlertsAt: '75,50,25,10,5' }])
   })
 
   test('text typed but not submitted is kept when you move on', async ($, on) => {
@@ -676,9 +674,36 @@ describe('setup walkthrough', () => {
     await pane.unmount()
   })
 
-  test('a denied write is reported, not swallowed', async ($, on) => {
-    const w = world(on)
-    on('config.set', () => ({ deny: 'locked by managed settings' }) as never)
+  test('saved picks win over settings, apply at once and on the next load; Use /config values drops them', async ($, on) => {
+    const w = world(on, { store: { setupSeen: true } })
+    await start($)
+    await request($, w, TYPICAL)
+    expect(w.statuses.filter(s => s !== undefined)).toHaveLength(0)
+    await $.command.run({ command: 'cache', args: 'setup' } as never)
+    let pane = await $.ui.mount({ plugin: 'cache-countdown', surface: 'terminal', component: 'Pane', requestId: 'cache-setup', props: { title: 'cache setup', isFocused: true, bodyColumns: 80, placement: 'dock' } as never })
+    await pane.press({ key: 'review' })
+    expect(await pane.find({ type: 'Button', key: 'reset' })).toBeUndefined()
+    await pane.press({ key: 'edit:status' })
+    await pane.press({ key: 'pick:status:true' })
+    await pane.press({ key: 'review' })
+    await pane.press({ key: 'save' })
+    await pane.unmount()
+    // applied without a reload: the footer line shows now
+    expect(w.statuses.at(-1)).toMatch(/^cache /)
+    // a new load reads the picks back from the store
+    await start($)
+    await $.command.run({ command: 'cache', args: 'setup' } as never)
+    pane = await $.ui.mount({ plugin: 'cache-countdown', surface: 'terminal', component: 'Pane', requestId: 'cache-setup', props: { title: 'cache setup', isFocused: true, bodyColumns: 80, placement: 'dock' } as never })
+    await pane.press({ key: 'review' })
+    expect(await pane.find({ type: 'Button', key: 'edit:status', text: /Footer line: on/ })).toBeDefined()
+    await pane.press({ key: 'reset' })
+    await pane.unmount()
+    expect(w.statuses.at(-1)).toBeUndefined()
+    expect(w.toasts.at(-1)).toContain('/config settings apply')
+  })
+
+  test('a failed save is reported, not swallowed', async ($, on) => {
+    const w = world(on, { failStore: 'options' })
     await start($)
     await $.command.run({ command: 'cache', args: 'setup' } as never)
     const pane = await $.ui.mount({ plugin: 'cache-countdown', surface: 'terminal', component: 'Pane', requestId: 'cache-setup', props: { title: 'cache setup', isFocused: true, bodyColumns: 80, placement: 'dock' } as never })
@@ -688,6 +713,7 @@ describe('setup walkthrough', () => {
     await pane.press({ key: 'review' })
     await pane.press({ key: 'save' })
     await pane.unmount()
-    expect(w.toasts.at(-1)).toContain('status not saved (locked by managed settings)')
+    expect(w.toasts.at(-1)).toContain('settings not saved')
+    expect(w.saved).toEqual([])
   })
 })

@@ -155,6 +155,20 @@ export const FIELDS: Field[] = [
   },
 ]
 
+/** The plugin's options the walkthrough can save: every row's, the toasts row standing for toast and toastAt. */
+export const OPTION_KEYS = [...FIELDS.filter(f => f.key !== 'toasts').map(f => f.key), 'toast', 'toastAt']
+
+/** What the plugin's store holds for the walkthrough's picks, kept to the option keys and plain values. */
+export function savedOptions(stored: unknown): Record<string, Value> {
+  const out: Record<string, Value> = {}
+  if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return out
+  for (const key of OPTION_KEYS) {
+    const v = (stored as Record<string, unknown>)[key]
+    if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') out[key] = v
+  }
+  return out
+}
+
 /** The manifest defaults, as the walkthrough's rows hold them. */
 export const DEFAULTS: SetupDraft = {
   ttl: 'auto',

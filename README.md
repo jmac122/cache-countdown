@@ -8,7 +8,7 @@ A prompt-cache meter for Claude Code, written as a mod (function hooks).
 
 - **Meter row above the input box**: hit %, read / wrote / new tokens, the time left on the cache, and advice: `warm`, `soon`, `expired` (suggests `/compact` on big contexts), `miss` (names the cause: model changed, cache lapsed, prefix changed), `off`.
 - **`/cache`**: a pane with the countdown bar, the last request as a stacked read/wrote/new bar, and a per-turn table with a totals row. `/cache stop`, Esc or `[ close ]` closes it.
-- **`/cache setup`**: a step-by-step walkthrough. Start from a preset (Recommended, Quiet, Live), then one step per setting that explains what it is for, with a hint on each choice and a `custom…` field where a list makes sense. A review page shows everything; Save writes your Claude Code settings the same way `/config` does, and the mod reloads with them.
+- **`/cache setup`**: a step-by-step walkthrough. Start from a preset (Recommended, Quiet, Live), then one step per setting that explains what it is for, with a hint on each choice and a `custom…` field where a list makes sense. A review page shows everything; Save keeps your picks in the plugin's own storage and applies them at once, without touching your settings files. A pick saved there wins over the same option set in `/config`; **Use /config values** on the review page drops the saved picks.
 - **Cache expiry toasts** before the cache expires (default at 1 min, 10 s, 5 s and 1 s left; set any times you like, e.g. `30m, 15m, 5m, 1m`).
 - **Context window alerts**, separate from the cache: a toast as the conversation crosses fill levels of the model's context window (default 50%, 25% and 10% remaining), for anyone whose status line doesn't show context usage. They re-arm after `/compact` or `/clear`.
 - Toasts are drawn inside Claude Code (top-right corner, about 4 s), not in the Windows or macOS notification center.
@@ -32,7 +32,7 @@ git clone https://github.com/jmac122/cache-countdown
 claude --plugin-dir ./cache-countdown
 ```
 
-It writes nothing to your settings until you press Save in `/cache setup`. On first load it shows one toast pointing at `/cache setup`, once ever.
+It never writes your settings files. On first load it shows one toast pointing at `/cache setup`, once ever.
 
 ## How often it wakes
 
@@ -50,7 +50,7 @@ On a 1-hour cache with the defaults that's about 120 wakes per hour instead of 3
 
 ## Options
 
-Use `/cache setup`, the `/config` menu, or `~/.claude/settings.json` under `pluginConfigs["cache-countdown@cache-countdown"].options` (marketplace install) or `pluginConfigs["cache-countdown"].options` (`--plugin-dir`):
+Use `/cache setup`, the `/config` menu, or `~/.claude/settings.json` under `pluginConfigs["cache-countdown@cache-countdown"].options` (marketplace install) or `pluginConfigs["cache-countdown"].options` (`--plugin-dir`). Picks saved in `/cache setup` live in the plugin's own storage and win over the same option in settings, until you press **Use /config values** there:
 
 | Option | Default | |
 | --- | --- | --- |
@@ -85,12 +85,14 @@ It reads:
 
 - The token counts (cache read, cache write, uncached input, output) and model name of each main-loop request, from `turn.step`.
 - The session's context window size and rate-limit info, from `$.session.usage()`. The rate-limit info is used only to tell a Claude subscription (1h cache) apart from API billing (5m cache).
-- The `promptCacheTtl` setting, and the environment variables `CLAUDE_CODE_PROMPT_CACHE_TTL`, `FORCE_PROMPT_CACHING_5M`, `ENABLE_PROMPT_CACHING_1H` and `DISABLE_PROMPT_CACHING` (plus its `_HAIKU`, `_SONNET` and `_OPUS` forms).
+- The `promptCacheTtl` setting, by that key alone (it never reads the rest of your settings, which can hold API keys under `env` or `apiKeyHelper`), and the environment variables `CLAUDE_CODE_PROMPT_CACHE_TTL`, `FORCE_PROMPT_CACHING_5M`, `ENABLE_PROMPT_CACHING_1H` and `DISABLE_PROMPT_CACHING` (plus its `_HAIKU`, `_SONNET` and `_OPUS` forms).
 
-It writes:
+It writes, only to the plugin's own storage (the per-plugin store Claude Code keeps for it, not your settings files):
 
-- Its own options, through `$.config.set`, only when you press Save in `/cache setup`, and only the ones you changed. They land under `pluginConfigs` in your Claude Code user settings, the same place `/config` puts them. The complete list of keys it can write is `cache-countdown.ttl`, `.tickSeconds`, `.warnSeconds`, `.finalTickSeconds`, `.toast`, `.toastAt`, `.contextAlertsAt`, `.compactWhenRemainingPct`, `.band` and `.status`. Each is spelled out in `hooks/cache-countdown.tsx` (`writeSetting`). It never sets environment variables, the permission mode, permissions, hooks, your statusline or any other setting.
-- One flag, `setupSeen`, in the plugin's own store, so the first-run hint shows only once.
+- `options`: the picks you saved in `/cache setup`, only when you press Save, and only the options you changed (`ttl`, `tickSeconds`, `warnSeconds`, `finalTickSeconds`, `toast`, `toastAt`, `contextAlertsAt`, `compactWhenRemainingPct`, `band`, `status`). **Use /config values** deletes it.
+- `setupSeen`: one flag, so the first-run hint shows only once.
+
+It never writes your settings, environment variables, the permission mode, permissions, hooks or your statusline.
 
 Request history lives in session memory (`$.state`) and is gone when the session ends. There is no telemetry, no account and no remote server, so there is no privacy policy.
 

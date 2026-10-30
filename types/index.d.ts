@@ -98,8 +98,6 @@ declare module 'claude-code' {
       alerts: number[]
       paneOpen: boolean
       draft: SetupDraft | null
-      setupNote: string
-      pending: SetupChange[]
       setupStep: number
     }
   }

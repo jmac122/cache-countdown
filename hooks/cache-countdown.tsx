@@ -9,7 +9,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, TurnUsage } from 'claude-code'
 
-import type { CacheSample, CacheView, SetupChange, SetupDraft } from '../types'
+import type { CacheSample, CacheView, SetupDraft } from '../types'
 import {
   accountKind,
   advise,
@@ -33,7 +33,7 @@ import {
   textBar,
 } from './cache'
 import type { Account, AdviceState, Config, Lifetime } from './cache'
-import { CUSTOM, FIELDS, PRESETS, REVIEW_STEP, STEP_COUNT, changes, display, draftFromOptions, encode, isListed } from './setup'
+import { CUSTOM, FIELDS, PRESETS, REVIEW_STEP, STEP_COUNT, changes, display, draftFromOptions, encode, isListed, savedOptions } from './setup'
 import type { Field } from './setup'
 
 const PANE = 'cache'
@@ -48,13 +48,18 @@ const observedAtom = atom({ plugin: 'cache-countdown', key: 'observed' } as cons
 const alertsAtom = atom({ plugin: 'cache-countdown', key: 'alerts' } as const, [])
 const paneAtom = atom({ plugin: 'cache-countdown', key: 'paneOpen' } as const, false)
 const draftAtom = atom({ plugin: 'cache-countdown', key: 'draft' } as const, null)
-const noteAtom = atom({ plugin: 'cache-countdown', key: 'setupNote' } as const, '')
-const pendingAtom = atom({ plugin: 'cache-countdown', key: 'pending' } as const, [])
 const stepAtom = atom({ plugin: 'cache-countdown', key: 'setupStep' } as const, 0)
 
 // ---------------------------------------------------------------- module state (starts over on every load)
 
-/** the options as stored (the walkthrough compares against these) */
+/** /cache setup keeps its picks here, in the plugin's own store, never in settings */
+const SAVED = 'options'
+
+/** the options from settings (/config, pluginConfigs) */
+let fromSettings: Readonly<Record<string, unknown>> = {}
+/** what /cache setup saved; each key here wins over settings */
+let saved: Readonly<Record<string, unknown>> = {}
+/** the options in force: settings, then the saved picks (the walkthrough compares against these) */
 let current: Readonly<Record<string, unknown>> = {}
 /** the options, checked and parsed */
 let cfg: Config = readConfig({})
@@ -88,8 +93,8 @@ async function readEnvironment($: EngineInterface) {
     $.env.get('DISABLE_PROMPT_CACHING_OPUS'),
   ])
   env = { ttl, force5m, enable1h, off: { all, haiku, sonnet, opus } }
-  const merged = await $.settings.read().catch(() => ({}) as Readonly<Record<string, unknown>>)
-  settingTtl = merged.promptCacheTtl
+  // one key, never the whole merged object: that also carries `env` and `apiKeyHelper`
+  settingTtl = await $.settings.read({ key: 'promptCacheTtl' }).catch(() => undefined)
 }
 
 async function refreshUsage($: EngineInterface) {
@@ -229,6 +234,7 @@ async function startSession($: EngineInterface) {
   stopTimer()
   shown = 0
   lastStatus = undefined
+  setOptions(savedOptions(await $.store.get(SAVED).catch(() => undefined)))
   await readEnvironment($)
   await refreshUsage($)
   await $.command.register({
@@ -241,7 +247,6 @@ async function startSession($: EngineInterface) {
   const view = await rebuild($)
   const off = view.off ? `, prompt caching is off (${view.off})` : ''
   $.ui.log(`cache-countdown loaded: ${view.ttlLabel} cache (${view.source})${off}, /cache opens the pane`, { to: 'debug' })
-  await applyPending($)
   await firstRun($)
   await restartCountdown($, view)
 }
@@ -332,49 +337,24 @@ async function snapshot($: EngineInterface, now: number) {
 
 // ---------------------------------------------------------------- setup walkthrough: actions
 
-/**
- * One config.set per option, each with its key spelled out, so anyone reading the
- * source (the plugin directory's scan included) can see exactly which settings it
- * can write: this plugin's own options under pluginConfigs, nothing else.
- */
-async function writeSetting($: EngineInterface, change: SetupChange): Promise<{ deny?: string }> {
-  const value = change.value
-  switch (change.key) {
-    case 'ttl': return $.config.set({ key: 'cache-countdown.ttl', value: value })
-    case 'tickSeconds': return $.config.set({ key: 'cache-countdown.tickSeconds', value: value })
-    case 'warnSeconds': return $.config.set({ key: 'cache-countdown.warnSeconds', value: value })
-    case 'finalTickSeconds': return $.config.set({ key: 'cache-countdown.finalTickSeconds', value: value })
-    case 'toast': return $.config.set({ key: 'cache-countdown.toast', value: value })
-    case 'toastAt': return $.config.set({ key: 'cache-countdown.toastAt', value: value })
-    case 'contextAlertsAt': return $.config.set({ key: 'cache-countdown.contextAlertsAt', value: value })
-    case 'compactWhenRemainingPct': return $.config.set({ key: 'cache-countdown.compactWhenRemainingPct', value: value })
-    case 'band': return $.config.set({ key: 'cache-countdown.band', value: value })
-    case 'status': return $.config.set({ key: 'cache-countdown.status', value: value })
-    default: return { deny: 'not an option of this plugin' }
-  }
+/** The options in force: settings, then the walkthrough's saved picks over them. */
+function setOptions(picks: Readonly<Record<string, unknown>>) {
+  saved = picks
+  current = { ...fromSettings, ...saved }
+  cfg = readConfig(current)
 }
 
-/**
- * Writes the wizard's queued settings. Each write reloads the mod, which can end
- * this environment mid-loop, so the queue lives in $.state: an item is taken off
- * before it is written, and the next load's session.start carries on.
- */
-async function applyPending($: EngineInterface) {
-  for (;;) {
-    const queue = (await read($, pendingAtom)) as SetupChange[]
-    const head = queue[0]
-    if (!head) return
-    await update($, pendingAtom, q => (q as SetupChange[]).slice(1))
-    const r = await writeSetting($, head).catch((err: unknown) => ({ deny: String(err) }))
-    const line = r.deny ? `${head.key} not saved (${r.deny})` : `${head.key} = ${encode(head.value)}`
-    await update($, noteAtom, note => (note ? `${note} · ${line}` : line))
-    if (queue.length === 1) $.ui.toast(`cache-countdown settings: ${(await read($, noteAtom)) as string}`)
-  }
+/** New saved picks take effect at once: the view, the countdown and the footer line are redrawn from them. */
+async function applyOptions($: EngineInterface, picks: Readonly<Record<string, unknown>>) {
+  const hadStatus = cfg.status
+  setOptions(picks)
+  if (hadStatus && !cfg.status && lastStatus !== undefined) $.ui.status(undefined)
+  lastStatus = undefined
+  await restartCountdown($, await rebuild($))
 }
 
 async function openSetup($: EngineInterface) {
   await update($, draftAtom, () => draftFromOptions(current))
-  await update($, noteAtom, () => '')
   await update($, stepAtom, () => 0)
   await $.ui.open({ id: SETUP, title: 'cache setup', focus: true, closeOnEscape: true, columns: 76, rows: 22 })
   await $.store.set('setupSeen', true).catch(() => undefined)
@@ -390,9 +370,30 @@ async function saveSetup($: EngineInterface) {
     $.ui.toast('cache-countdown: nothing changed')
     return
   }
-  await update($, noteAtom, () => '')
-  await update($, pendingAtom, () => todo)
-  await applyPending($)
+  const picks: Record<string, unknown> = { ...saved }
+  for (const c of todo) picks[c.key] = c.value
+  try {
+    await $.store.set(SAVED, picks)
+  } catch (err) {
+    $.ui.toast(`cache-countdown: settings not saved (${String(err)})`)
+    return
+  }
+  await applyOptions($, picks)
+  $.ui.toast(`cache-countdown settings: ${todo.map(c => `${c.key} = ${encode(c.value)}`).join(' · ')}`)
+}
+
+/** Drop the walkthrough's saved picks, so the options in settings (/config) apply again. */
+async function resetSetup($: EngineInterface) {
+  await $.ui.close({ id: SETUP }).catch(() => undefined)
+  await update($, draftAtom, () => null)
+  try {
+    await $.store.delete(SAVED)
+  } catch (err) {
+    $.ui.toast(`cache-countdown: picks not cleared (${String(err)})`)
+    return
+  }
+  await applyOptions($, {})
+  $.ui.toast('cache-countdown: setup picks cleared, the /config settings apply')
 }
 
 async function pickSetup($: EngineInterface, key: string, value: string | number | boolean) {
@@ -437,8 +438,8 @@ async function presetSetup($: EngineInterface, draft: SetupDraft) {
 // ---------------------------------------------------------------- hooks
 
 export const register: Register = (on, options) => {
-  current = options
-  cfg = readConfig(options)
+  fromSettings = options
+  setOptions({})
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -655,6 +656,7 @@ export const register: Register = (on, options) => {
           <Button key="save" label={count ? `Save ${count} change${count === 1 ? '' : 's'}` : 'Save'} variant="primary" onPress={() => void saveSetup($)} />
         )}
         {step < REVIEW_STEP ? <Button key="review" label="Skip to review" onPress={() => void gotoStep($, REVIEW_STEP)} /> : null}
+        {step === REVIEW_STEP && Object.keys(saved).length > 0 ? <Button key="reset" label="Use /config values" onPress={() => void resetSetup($)} /> : null}
         <Button key="cancel" label="Cancel" role="dismiss" onPress={() => void $.ui.close({ id: SETUP })} />
       </Box>
     )
@@ -680,7 +682,10 @@ export const register: Register = (on, options) => {
       return (
         <Box flexDirection="column">
           {heading('Review and save')}
-          {help(['Click a row to change it. Save writes your Claude Code settings, like /config, and the mod reloads with them.'])}
+          {help([
+            'Click a row to change it. Save keeps your picks in the plugin\'s own storage (your settings files are not touched) and applies them at once.',
+            'A setting saved here wins over the same one in /config; "Use /config values" drops the picks saved here.',
+          ])}
           <Box key="rows" flexDirection="column" marginTop={gap}>
             {FIELDS.map((f, i) => {
               const changed = encode(draft[f.key] ?? '') !== encode(draftFromOptions(current)[f.key] ?? '')
