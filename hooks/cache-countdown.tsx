@@ -15,6 +15,7 @@ import {
   advise,
   baseLifetime,
   buildView,
+  cachingOff,
   contextToast,
   countdownText,
   crossLevels,
@@ -63,6 +64,9 @@ let current: Readonly<Record<string, unknown>> = {}
 /** the options, checked and parsed */
 let cfg: Config = readConfig({})
 
+type Environment = { ttl?: string; force5m?: string; enable1h?: string; off: { all?: string; haiku?: string; sonnet?: string; opus?: string } }
+let env: Environment = { off: {} }
+let settingTtl: unknown
 let account: Account = 'other'
 let contextWindow = 0
 
@@ -78,6 +82,21 @@ let paneShown = false
 
 // ---------------------------------------------------------------- reading the world
 
+async function readEnvironment($: EngineInterface) {
+  const [ttl, force5m, enable1h, all, haiku, sonnet, opus] = await Promise.all([
+    $.env.get('CLAUDE_CODE_PROMPT_CACHE_TTL'),
+    $.env.get('FORCE_PROMPT_CACHING_5M'),
+    $.env.get('ENABLE_PROMPT_CACHING_1H'),
+    $.env.get('DISABLE_PROMPT_CACHING'),
+    $.env.get('DISABLE_PROMPT_CACHING_HAIKU'),
+    $.env.get('DISABLE_PROMPT_CACHING_SONNET'),
+    $.env.get('DISABLE_PROMPT_CACHING_OPUS'),
+  ])
+  env = { ttl, force5m, enable1h, off: { all, haiku, sonnet, opus } }
+  // one key, never the whole merged object: that also carries `env` and `apiKeyHelper`
+  settingTtl = await $.settings.read({ key: 'promptCacheTtl' }).catch(() => undefined)
+}
+
 async function refreshUsage($: EngineInterface) {
   try {
     const usage = await $.session.usage()
@@ -89,13 +108,13 @@ async function refreshUsage($: EngineInterface) {
 }
 
 const baseNow = (): Lifetime =>
-  baseLifetime({ option: cfg.ttl, account })
+  baseLifetime({ option: cfg.ttl, force5m: env.force5m, envTtl: env.ttl, settingTtl, enable1h: env.enable1h, account })
 
 /** Rebuilds the view from the kept samples and stores it: once per request, at load and on /clear. */
 async function rebuild($: EngineInterface): Promise<CacheView> {
   const samples = await read($, samplesAtom)
   const lifetime = effectiveLifetime(baseNow(), await read($, observedAtom))
-  const view = buildView({ samples, lifetime, off: null, window: contextWindow })
+  const view = buildView({ samples, lifetime, off: cachingOff(env.off, samples.at(-1)?.model), window: contextWindow })
   await update($, viewAtom, () => view)
   return view
 }
@@ -216,6 +235,7 @@ async function startSession($: EngineInterface) {
   shown = 0
   lastStatus = undefined
   setOptions(savedOptions(await $.store.get(SAVED).catch(() => undefined)))
+  await readEnvironment($)
   await refreshUsage($)
   await $.command.register({
     name: 'cache',
