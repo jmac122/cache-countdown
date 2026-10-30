@@ -6,7 +6,7 @@ A prompt-cache meter for Claude Code, written as a mod (function hooks).
 ● cache ██████████ 86% read 317k wrote 52.3k new 2 ⏱ 59m 1h · warm: keep going
 ```
 
-- **Meter row above the input box**: hit %, read / wrote / new tokens, the time left on the cache, and advice: `warm`, `soon`, `expired` (suggests `/compact` on big contexts), `miss` (names the cause: model changed, cache lapsed, prefix changed), `off`.
+- **Meter row above the input box**: hit %, read / wrote / new tokens, the time left on the cache, and advice: `warm`, `soon`, `expired` (suggests `/compact` on big contexts), `miss` (names the cause: model changed, cache lapsed, prefix changed).
 - **`/cache`**: a pane with the countdown bar, the last request as a stacked read/wrote/new bar, and a per-turn table with a totals row. `/cache stop`, Esc or `[ close ]` closes it.
 - **`/cache setup`**: a step-by-step walkthrough. Start from a preset (Recommended, Quiet, Live), then one step per setting that explains what it is for, with a hint on each choice and a `custom…` field where a list makes sense. A review page shows everything; Save keeps your picks in the plugin's own storage and applies them at once, without touching your settings files. A pick saved there wins over the same option set in `/config`; **Use /config values** on the review page drops the saved picks.
 - **Cache expiry toasts** before the cache expires (default at 1 min, 10 s, 5 s and 1 s left; set any times you like, e.g. `30m, 15m, 5m, 1m`).
@@ -43,7 +43,7 @@ There is no fixed interval. One timer sleeps until the next moment something cha
 | more than `warnSeconds` | `59m` | every `tickSeconds` (default 60) |
 | the last `warnSeconds` (default 60) | `0:42` | every `finalTickSeconds` (default 1) |
 | a toast mark | | once, at the mark |
-| expired, nothing cached, caching off | `0:00` | never, until your next request |
+| expired, or nothing cached | `0:00` | never, until your next request |
 | meter row, footer line and toasts all off, `/cache` closed | | never: nothing to draw or announce |
 
 On a 1-hour cache with the defaults that's about 120 wakes per hour instead of 3,600. Each wake redraws only the band and the pane, which takes about 1–5 ms per redraw (measured in a live session).
@@ -67,15 +67,11 @@ Use `/cache setup`, the `/config` menu, or `~/.claude/settings.json` under `plug
 
 ## Which cache lifetime (`ttl: auto`)
 
-The first match wins:
+It starts from the account: a Claude subscription within plan usage → 1h; usage credits, an API key or a cloud provider → 5m.
 
-1. `FORCE_PROMPT_CACHING_5M=1` → 5m
-2. `CLAUDE_CODE_PROMPT_CACHE_TTL` → `5m` / `1h`
-3. the `promptCacheTtl` setting, read merged over user, project, local, `--settings` and managed settings
-4. `ENABLE_PROMPT_CACHING_1H=1` → 1h
-5. the account: a Claude subscription within plan usage → 1h; usage credits, an API key or a cloud provider → 5m
+Request timing then corrects it. A cache hit more than 5 minutes after the previous request proves the 1h lifetime. A miss 5–60 minutes later, with the same model and a prompt that didn't shrink, says 5m. The `/cache` pane names the source in use.
 
-Request timing then corrects it. A cache hit more than 5 minutes after the previous request proves the 1h lifetime. A miss 5–60 minutes later, with the same model and a prompt that didn't shrink, says 5m. The `/cache` pane names the source in use. `DISABLE_PROMPT_CACHING` (and its `_HAIKU`, `_SONNET` and `_OPUS` forms) shows `off`.
+cache-countdown reads no environment variables and no settings. If you change the lifetime with Claude Code's own overrides (`CLAUDE_CODE_PROMPT_CACHE_TTL`, `FORCE_PROMPT_CACHING_5M`, `ENABLE_PROMPT_CACHING_1H` or the `promptCacheTtl` setting), request timing picks it up, or set `ttl` to `5m` or `1h` to match from the first request. With prompt caching turned off, every request shows as uncached.
 
 ## Data and privacy
 
@@ -85,7 +81,8 @@ It reads:
 
 - The token counts (cache read, cache write, uncached input, output) and model name of each main-loop request, from `turn.step`.
 - The session's context window size and rate-limit info, from `$.session.usage()`. The rate-limit info is used only to tell a Claude subscription (1h cache) apart from API billing (5m cache).
-- The `promptCacheTtl` setting, by that key alone (it never reads the rest of your settings, which can hold API keys under `env` or `apiKeyHelper`), and the environment variables `CLAUDE_CODE_PROMPT_CACHE_TTL`, `FORCE_PROMPT_CACHING_5M`, `ENABLE_PROMPT_CACHING_1H` and `DISABLE_PROMPT_CACHING` (plus its `_HAIKU`, `_SONNET` and `_OPUS` forms).
+
+It reads no environment variables and none of your settings.
 
 It writes, only to the plugin's own storage (the per-plugin store Claude Code keeps for it, not your settings files):
 
@@ -98,7 +95,7 @@ Request history lives in session memory (`$.state`) and is gone when the session
 
 ## What it hooks
 
-- `session.start`: reads the settings and env vars above, registers `/cache`.
+- `session.start`: reads its saved picks and the session usage above, registers `/cache`.
 - `session.end`: on `/clear`, resets the meter.
 - `turn.step`: records each main-loop request's token counts (subagents are skipped; they have their own cache prefixes). It passes every request through unchanged.
 - `command.run`: answers `/cache`, `/cache setup` and `/cache stop`. Every other command passes straight through untouched; it never sees, changes or blocks them.

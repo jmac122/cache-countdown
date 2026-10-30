@@ -36,10 +36,8 @@ const ADVICE = { warnSeconds: 60, compactWhenRemainingPct: 60 }
 // ---------------------------------------------------------------- helpers
 
 type WorldOptions = {
-  env?: Record<string, string>
   window?: number
   limits?: { kind: string; percentUsed: number }[]
-  settings?: Record<string, unknown>
   store?: Record<string, unknown>
   /** a store key whose writes fail */
   failStore?: string
@@ -60,7 +58,6 @@ type World = {
 /** Everything beneath the plugin: each `$` call it makes is answered here. */
 function world(on: On, o: WorldOptions = {}): World {
   const w: World = { clock: mock.clock(on, { now: T0 }), toasts: [], logs: [], statuses: [], ticks: 0, usage: [], saved: [] }
-  mock.env(on, o.env ?? {})
   const store = new Map(Object.entries(o.store ?? { setupSeen: true }))
   on('store.get', ($, e) => ({ value: store.get(e.key) }) as never)
   on('store.set', ($, e) => {
@@ -92,7 +89,6 @@ function world(on: On, o: WorldOptions = {}): World {
   on('ui.focus', () => ({ value: {} }) as never)
   on('command.register', () => ({ value: { command: 'cache' } }) as never)
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: o.window ?? 0 }, rateLimits: o.limits ?? [] } }) as never)
-  on('settings.read', () => ({ value: o.settings ?? {} }) as never)
   on('session.start', ($, e) => ({ cwd: e.cwd }) as never)
   on('session.end', ($, e) => ({ sessionId: e.sessionId }) as never)
   on('state.set', ($, e, pass) => {
@@ -162,13 +158,10 @@ const viewOf = (samples: CacheSample[], lifetime: Lifetime = FIVE, window = 0, o
 // ---------------------------------------------------------------- pure logic
 
 describe('cache lifetime', () => {
-  test('ttl order: option, FORCE_5M, env var, setting, ENABLE_1H, account', () => {
-    expect(baseLifetime({ option: '1h', force5m: '1', account: 'other' })).toEqual({ ttl: 3600, source: 'ttl option', pinned: true })
-    expect(baseLifetime({ option: 'auto', force5m: 'true', envTtl: '1h', settingTtl: '1h', account: 'subscription' })).toMatchObject({ ttl: 300, source: 'FORCE_PROMPT_CACHING_5M' })
-    expect(baseLifetime({ option: 'auto', envTtl: '5m', enable1h: '1', account: 'subscription' })).toMatchObject({ ttl: 300, source: 'CLAUDE_CODE_PROMPT_CACHE_TTL' })
-    expect(baseLifetime({ option: 'auto', settingTtl: '5m', enable1h: 'yes', account: 'subscription' })).toMatchObject({ ttl: 300, source: 'promptCacheTtl setting' })
-    expect(baseLifetime({ option: 'auto', enable1h: 'ON', account: 'other' })).toMatchObject({ ttl: 3600, source: 'ENABLE_PROMPT_CACHING_1H' })
-    expect(baseLifetime({ option: 'auto', settingTtl: '15m', envTtl: 'soon', force5m: '0', account: 'subscription' })).toMatchObject({ ttl: 3600, source: 'Claude subscription default' })
+  test('ttl: the option pins it, else the account decides', () => {
+    expect(baseLifetime({ option: '1h', account: 'other' })).toEqual({ ttl: 3600, source: 'ttl option', pinned: true })
+    expect(baseLifetime({ option: '5m', account: 'subscription' })).toEqual({ ttl: 300, source: 'ttl option', pinned: true })
+    expect(baseLifetime({ option: 'auto', account: 'subscription' })).toMatchObject({ ttl: 3600, source: 'Claude subscription default' })
     expect(baseLifetime({ option: 'junk', account: 'credits' })).toMatchObject({ ttl: 300 })
     expect(baseLifetime({ option: 'auto', account: 'other' })).toMatchObject({ ttl: 300 })
   })
@@ -380,19 +373,6 @@ describe('band', () => {
     expect(await b.find({ type: 'Text', text: /read|cache/ })).toBeUndefined()
     await b.unmount()
   })
-
-  test('caching off: says so, no countdown, no wakes', async ($, on) => {
-    const w = world(on, { env: { DISABLE_PROMPT_CACHING: '1' } })
-    await start($)
-    const b = await band($)
-    expect(await b.find({ type: 'Text', text: /prompt caching is off/ })).toBeDefined()
-    await request($, w, TYPICAL)
-    expect(await b.find({ type: 'Text', text: /prompt caching is off/ })).toBeDefined()
-    expect(await b.find({ type: 'Text', text: /⏱/ })).toBeUndefined()
-    await w.clock.advance(10 * MIN)
-    expect(w.ticks).toBe(0)
-    await b.unmount()
-  })
 })
 
 describe('countdown', () => {
@@ -519,8 +499,7 @@ describe('context window alerts', () => {
 describe('lifetime sources at load', () => {
   const cases = [
     ['subscription', {}, { limits: [{ kind: 'five_hour', percentUsed: 20 }] }, '1h cache (Claude subscription default)'],
-    ['env var', {}, { env: { CLAUDE_CODE_PROMPT_CACHE_TTL: '5m' }, limits: [{ kind: 'five_hour', percentUsed: 20 }] }, '5m cache (CLAUDE_CODE_PROMPT_CACHE_TTL)'],
-    ['setting', {}, { settings: { promptCacheTtl: '1h' } }, '1h cache (promptCacheTtl setting)'],
+    ['API key', {}, {}, '5m cache (API key or cloud provider)'],
     ['option', { ttl: '5m' }, { limits: [{ kind: 'five_hour', percentUsed: 20 }] }, '5m cache (ttl option)'],
   ] as const
   for (const [name, options, worldOptions, line] of cases) {

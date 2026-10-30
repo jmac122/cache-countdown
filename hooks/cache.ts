@@ -119,33 +119,25 @@ export function accountKind(limits: readonly { kind: string; percentUsed: number
 export type LifetimeInputs = {
   /** the ttl option: 'auto', '5m' or '1h' */
   option: string
-  force5m?: string
-  envTtl?: string
-  settingTtl?: unknown
-  enable1h?: string
   account: Account
 }
 
 export type Lifetime = { ttl: number; source: string; pinned: boolean }
-
-const TRUTHY = new Set(['1', 'true', 'yes', 'on'])
-export const isTruthy = (v: string | undefined) => v !== undefined && TRUTHY.has(v.trim().toLowerCase())
 
 const ttlValue = (v: unknown): number | undefined => {
   const s = typeof v === 'string' ? v.trim().toLowerCase() : ''
   return s === '5m' ? 300 : s === '1h' ? 3600 : undefined
 }
 
-/** The cache lifetime before request timing has a say, first match wins. */
+/**
+ * The cache lifetime before request timing has a say: the option when it pins one,
+ * else the account's default. It reads no environment variables or settings, so an
+ * override of Claude Code's own (an env var, promptCacheTtl) shows up through
+ * request timing, or is pinned with the option.
+ */
 export function baseLifetime(i: LifetimeInputs): Lifetime {
   const option = ttlValue(i.option)
   if (option) return { ttl: option, source: 'ttl option', pinned: true }
-  if (isTruthy(i.force5m)) return { ttl: 300, source: 'FORCE_PROMPT_CACHING_5M', pinned: false }
-  const env = ttlValue(i.envTtl)
-  if (env) return { ttl: env, source: 'CLAUDE_CODE_PROMPT_CACHE_TTL', pinned: false }
-  const setting = ttlValue(i.settingTtl)
-  if (setting) return { ttl: setting, source: 'promptCacheTtl setting', pinned: false }
-  if (isTruthy(i.enable1h)) return { ttl: 3600, source: 'ENABLE_PROMPT_CACHING_1H', pinned: false }
   if (i.account === 'subscription') return { ttl: 3600, source: 'Claude subscription default', pinned: false }
   if (i.account === 'credits') return { ttl: 300, source: 'usage credits (plan limit reached)', pinned: false }
   return { ttl: 300, source: 'API key or cloud provider', pinned: false }
@@ -158,16 +150,6 @@ export function effectiveLifetime(base: Lifetime, observed: CacheObserved | null
   if (base.pinned || !observed) return base
   if (observed.ttl === base.ttl) return { ...base, source: `${base.source}, confirmed by traffic` }
   return { ttl: observed.ttl, source: `observed from request timing (${base.source} said ${ttlLabel(base.ttl)})`, pinned: false }
-}
-
-/** The variable that turns caching off for this model, or null. */
-export function cachingOff(env: { all?: string; haiku?: string; sonnet?: string; opus?: string }, model: string | undefined): string | null {
-  if (isTruthy(env.all)) return 'DISABLE_PROMPT_CACHING'
-  const m = (model ?? '').toLowerCase()
-  if (m.includes('haiku') && isTruthy(env.haiku)) return 'DISABLE_PROMPT_CACHING_HAIKU'
-  if (m.includes('sonnet') && isTruthy(env.sonnet)) return 'DISABLE_PROMPT_CACHING_SONNET'
-  if (m.includes('opus') && isTruthy(env.opus)) return 'DISABLE_PROMPT_CACHING_OPUS'
-  return null
 }
 
 // ---------------------------------------------------------------- reading traffic
