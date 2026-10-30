@@ -20,7 +20,7 @@
     "ttl": {
       "type": "string",
       "title": "Cache lifetime",
-      "description": "auto follows Claude Code's rules (FORCE_PROMPT_CACHING_5M, CLAUDE_CODE_PROMPT_CACHE_TTL, promptCacheTtl setting, ENABLE_PROMPT_CACHING_1H, then 1h on a Claude subscription / 5m otherwise) and corrects itself from request timing; 5m or 1h pins it; any other value means auto",
+      "description": "auto follows Claude Code's own rules (listed in the README) and corrects itself from request timing; 5m or 1h pins it; any other value means auto",
       "default": "auto"
     },
     "warnSeconds": {

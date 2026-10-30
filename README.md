@@ -16,7 +16,7 @@ A prompt-cache meter for Claude Code, written as a mod (function hooks).
 
 ## Install
 
-Requires Claude Code 2.1.287 or later (mods).
+Requires Claude Code 2.1.309 or later (mods).
 
 **From the marketplace** (loads in every session):
 
